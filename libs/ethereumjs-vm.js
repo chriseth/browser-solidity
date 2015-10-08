@@ -95,8 +95,8 @@ Bloom.prototype.or = function (bloom) {
 }).call(this,require("buffer").Buffer)
 },{"assert":220,"buffer":222,"ethereumjs-util":90}],3:[function(require,module,exports){
 (function (Buffer){
-const Tree = require('functional-red-black-tree')
-const Account = require('ethereumjs-account')
+const Tree = window.Trie = require('functional-red-black-tree')
+const Account = window.Account = require('ethereumjs-account')
 const async = require('async')
 
 var Cache = module.exports = function (trie) {
@@ -17397,7 +17397,7 @@ BlockHeader.prototype.isGenesis = function () {
 (function (Buffer){
 require('es6-shim')
 const ethUtil = require('ethereumjs-util')
-const Tx = require('ethereumjs-tx')
+const Tx = window.Tx = require('ethereumjs-tx')
 const Trie = require('merkle-patricia-tree')
 const BN = ethUtil.BN
 const rlp = ethUtil.rlp
@@ -17410,7 +17410,7 @@ const params = require('ethereum-common')
  * @constructor
  * @param {Array} data raw data, deserialized
  */
-var Block = module.exports = function (data) {
+var Block = window.Block = module.exports = function (data) {
   this.transactions = []
   this.uncleHeaders = []
   this._inBlockChain = false
