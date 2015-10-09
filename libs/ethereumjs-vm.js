@@ -2454,8 +2454,8 @@ module.exports = function (opts, cb) {
   }
 
   if (new BN(block.header.gasLimit).cmp(new BN(tx.gasLimit)) === -1) {
-    cb(new Error('tx has a higher gas limit than the block'))
-    return
+    // cb(new Error('tx has a higher gas limit than the block'))
+    // return
   }
 
   // run everything
