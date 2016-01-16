@@ -1,3 +1,4 @@
+soljson-v0.2.0-2016-01-15-cc4b4f5.js
 soljson-v0.2.0-2016-01-14-ca45cfe.js
 soljson-v0.2.0-2016-01-13-d2f18c7.js
 soljson-v0.2.0-2016-01-12-02c1aac.js
