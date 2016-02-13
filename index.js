@@ -55,8 +55,8 @@ function setupMethods (soljson){
 		compile: compile,
 		useVersion: function( versionString ){
 			return setupMethods( require('./bin/soljson-' + versionString + '.js' ) );
-		},useCompiler: function( compiler ){
-			return setupMethods( require(compiler) );
+		},useCompilerPath: function( compilerPath ){
+			return setupMethods( require(compilerPath) );
 		}
 	}
 }
