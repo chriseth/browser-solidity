@@ -1,2895 +1,4 @@
-(function(f){if(typeof exports==="object"&&typeof module!=="undefined"){module.exports=f()}else if(typeof define==="function"&&define.amd){define([],f)}else{var g;if(typeof window!=="undefined"){g=window}else if(typeof global!=="undefined"){g=global}else if(typeof self!=="undefined"){g=self}else{g=this}g.EthVm = f()}})(function(){var define,module,exports;return (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
-module.exports = require('./lib/index.js')
-
-},{"./lib/index.js":6}],2:[function(require,module,exports){
-(function (Buffer){
-const assert = require('assert')
-const utils = require('ethereumjs-util')
-const byteSize = 256
-
-/**
- * Represents a Bloom
- * @constructor
- * @param {Buffer} bitvector
- */
-var Bloom = module.exports = function (bitvector) {
-  if (!bitvector) {
-    this.bitvector = utils.zeros(byteSize)
-  } else {
-    assert(bitvector.length === byteSize, 'bitvectors must be 2048 bits long')
-    this.bitvector = bitvector
-  }
-}
-
-/**
- * adds an element to a bit vector of a 64 byte bloom filter
- * @method add
- * @param {Buffer} element
- */
-Bloom.prototype.add = function (e) {
-  e = utils.sha3(e)
-  var mask = 2047 // binary 11111111111
-
-  for (var i = 0; i < 3; i++) {
-    var first2bytes = e.readUInt16BE(i * 2)
-    var loc = mask & first2bytes
-    var byteLoc = loc >> 3
-    var bitLoc = 1 << loc % 8
-    this.bitvector[byteSize - byteLoc - 1] |= bitLoc
-  }
-}
-
-/**
- * checks if an element is in the blooom
- * @method check
- * @param {Buffer} element
- */
-Bloom.prototype.check = function (e) {
-  e = utils.sha3(e)
-  var mask = 511 // binary 111111111
-  var match = true
-
-  for (var i = 0; i < 3 && match; i++) {
-    var first2bytes = e.readUInt16BE(i * 2)
-    var loc = mask & first2bytes
-    var byteLoc = loc >> 3
-    var bitLoc = 1 << loc % 8
-    match = (this.bitvector[byteSize - byteLoc - 1] & bitLoc)
-  }
-
-  return Boolean(match)
-}
-
-/**
- * checks if multple topics are in a bloom
- * @method check
- * @param {Buffer} element
- */
-Bloom.prototype.multiCheck = function (topics) {
-  var self = this
-  var match = true
-  topics.forEach(function (t) {
-    if (!Buffer.isBuffer(t)) {
-      t = new Buffer(t, 'hex')
-    }
-
-    match && self.check(t)
-  })
-
-  return match
-}
-
-/**
- * bitwise or blooms together
- * @method or
- * @param {Bloom} bloom
- */
-Bloom.prototype.or = function (bloom) {
-  if (bloom) {
-    for (var i = 0; i <= byteSize; i++) {
-      this.bitvector[i] = this.bitvector[i] | bloom.bitvector[i]
-    }
-  }
-}
-
-}).call(this,require("buffer").Buffer)
-},{"assert":149,"buffer":179,"ethereumjs-util":66}],3:[function(require,module,exports){
-(function (Buffer){
-const Tree = require('functional-red-black-tree')
-const Account = require('ethereumjs-account')
-const async = require('async')
-
-var Cache = module.exports = function (trie) {
-  this._cache = Tree()
-  this._checkpoints = []
-  this._deletes = []
-  this._trie = trie
-}
-
-Cache.prototype.put = function (key, val, fromTrie) {
-  var exists
-  if (val.exists) {
-    exists = val.exists
-  } else {
-    exists = true
-  }
-
-  var modified = !fromTrie
-  key = key.toString('hex')
-  var it = this._cache.find(key)
-  if (it.node) {
-    this._cache = it.update({
-      val: val,
-      modified: modified,
-      exists: true
-    })
-  } else {
-    this._cache = this._cache.insert(key, {
-      val: val,
-      modified: modified,
-      exists: exists
-    })
-  }
-}
-
-// returns the queried account or an empty account
-Cache.prototype.get = function (key) {
-  var account = this.lookup(key)
-  if (!account) {
-    account = new Account()
-    account.exists = false
-  }
-  return account
-}
-
-// returns the queried account or undefined
-Cache.prototype.lookup = function (key) {
-  key = key.toString('hex')
-
-  var it = this._cache.find(key)
-  if (it.node) {
-    var account = new Account(it.value.val)
-    account.exists = it.value.exists
-    return account
-  }
-}
-
-Cache.prototype._lookupAccount = function (address, cb) {
-  var self = this
-  self._trie.get(address, function (err, raw) {
-    if (err) return cb(err)
-    var account = new Account(raw)
-    var exists = !!raw
-    account.exists = exists
-    cb(null, account, exists)
-  })
-}
-
-Cache.prototype.getOrLoad = function (key, cb) {
-  var self = this
-  var account = this.lookup(key)
-  if (account) {
-    cb(null, account)
-  } else {
-    self._lookupAccount(key, function (err, account, exists) {
-      if (err) return cb(err)
-      // ugly manual cache insertion
-      self._cache = self._cache.insert(key.toString('hex'), {
-        val: account,
-        modified: false,
-        exists: exists
-      })
-      cb(null, account)
-    })
-  }
-}
-
-Cache.prototype.warm = function (addresses, cb) {
-  var self = this
-  // shim till async supports iterators
-  var accountArr = []
-  addresses.forEach(function (val) {
-    if (val) accountArr.push(val)
-  })
-
-  async.eachSeries(accountArr, function (addressHex, done) {
-    var address = new Buffer(addressHex, 'hex')
-    self._lookupAccount(address, function (err, account) {
-      self._cache = self._cache.insert(addressHex, {
-        val: account,
-        modified: false,
-        exists: account.exists
-      })
-
-      done(err)
-    })
-  }, cb)
-}
-
-Cache.prototype.flush = function (cb) {
-  var it = this._cache.begin
-  var self = this
-  var next = true
-  async.whilst(function () {
-    return next
-  }, function (done) {
-    if (it.value.modified) {
-      it.value.modified = false
-      it.value.val = it.value.val.serialize()
-      self._trie.put(new Buffer(it.key, 'hex'), it.value.val, function () {
-        next = it.hasNext
-        it.next()
-        done()
-      })
-    } else {
-      next = it.hasNext
-      it.next()
-      done()
-    }
-  }, function () {
-    async.eachSeries(self._deletes, function (address, done) {
-      self._trie.del(address, done)
-    }, function () {
-      self._deletes = []
-      cb()
-    })
-  })
-}
-
-Cache.prototype.checkpoint = function () {
-  this._checkpoints.push(this._cache)
-}
-
-Cache.prototype.revert = function () {
-  this._cache = this._checkpoints.pop(this._cache)
-}
-
-Cache.prototype.commit = function () {
-  this._checkpoints.pop()
-}
-
-Cache.prototype.clear = function () {
-  this._deletes = []
-  this._cache = Tree()
-}
-
-Cache.prototype.del = function (key) {
-  this._deletes.push(key)
-  key = key.toString('hex')
-  this._cache = this._cache.remove(key)
-}
-
-}).call(this,require("buffer").Buffer)
-},{"async":30,"buffer":179,"ethereumjs-account":61,"functional-red-black-tree":67}],4:[function(require,module,exports){
-exports.ERROR = {
-  OUT_OF_GAS: 'out of gas',
-  STACK_UNDERFLOW: 'stack underflow',
-  INVALID_JUMP: 'invalid JUMP',
-  INVALID_OPCODE: 'invalid opcode'
-}
-
-},{}],5:[function(require,module,exports){
-(function (Buffer){
-var utils = require('ethereumjs-util')
-
-module.exports = {
-  getBlock: function (n, cb) {
-    var hash = utils.sha3(new Buffer(utils.bufferToInt(n).toString()))
-
-    var block = {
-      hash: function () {
-        return hash
-      }
-    }
-
-    cb(null, block)
-  }
-}
-
-}).call(this,require("buffer").Buffer)
-},{"buffer":179,"ethereumjs-util":66}],6:[function(require,module,exports){
-const util = require('util')
-const StateManager = require('./stateManager.js')
-const AsyncEventEmitter = require('async-eventemitter')
-
-// require the percomiled contracts
-const num01 = require('./precompiled/01-ecrecover.js')
-const num02 = require('./precompiled/02-sha256.js')
-const num03 = require('./precompiled/03-ripemd160.js')
-const num04 = require('./precompiled/04-identity.js')
-
-module.exports = VM
-
-VM.deps = {
-  ethUtil: require('ethereumjs-util'),
-  Account: require('ethereumjs-account'),
-  Trie: require('merkle-patricia-tree'),
-  rlp: require('ethereumjs-util').rlp,
-  Transaction: require('ethereumjs-tx')
-}
-
-/**
- * @constructor
- */
-function VM (trie, blockchain) {
-  this.stateManager = new StateManager({
-    trie: trie,
-    blockchain: blockchain
-  })
-
-  // temporary
-  // this is here for a gradual transition to StateManager
-  this.blockchain = this.stateManager.blockchain
-  this.trie = this.stateManager.trie
-
-  // precompiled contracts
-  this._precompiled = {}
-  this._precompiled['0000000000000000000000000000000000000001'] = num01
-  this._precompiled['0000000000000000000000000000000000000002'] = num02
-  this._precompiled['0000000000000000000000000000000000000003'] = num03
-  this._precompiled['0000000000000000000000000000000000000004'] = num04
-
-  AsyncEventEmitter.call(this)
-}
-
-util.inherits(VM, AsyncEventEmitter)
-
-VM.prototype.runCode = require('./runCode.js')
-VM.prototype.runJIT = require('./runJit.js')
-VM.prototype.runBlock = require('./runBlock.js')
-VM.prototype.runTx = require('./runTx.js')
-VM.prototype.runCall = require('./runCall.js')
-VM.prototype.runBlockchain = require('./runBlockchain.js')
-
-VM.prototype.copy = function () {
-  var trie = this.trie.copy()
-  return new VM(trie, this.blockchain)
-}
-
-/**
- * Loads precompiled contracts into the state
- */
-VM.prototype.loadCompiled = function (address, src, cb) {
-  this.trie.db.put(address, src, cb)
-}
-
-VM.prototype.populateCache = function (addresses, cb) {
-  this.stateManager.warmCache(addresses, cb)
-}
-
-},{"./precompiled/01-ecrecover.js":10,"./precompiled/02-sha256.js":11,"./precompiled/03-ripemd160.js":12,"./precompiled/04-identity.js":13,"./runBlock.js":14,"./runBlockchain.js":15,"./runCall.js":16,"./runCode.js":17,"./runJit.js":18,"./runTx.js":19,"./stateManager.js":20,"async-eventemitter":27,"ethereumjs-account":61,"ethereumjs-tx":64,"ethereumjs-util":66,"merkle-patricia-tree":105,"util":269}],7:[function(require,module,exports){
-const utils = require('ethereumjs-util')
-const BN = utils.BN
-const pow32 = new BN('010000000000000000000000000000000000000000000000000000000000000000', 16)
-const pow31 = new BN('0100000000000000000000000000000000000000000000000000000000000000', 16)
-const pow30 = new BN('01000000000000000000000000000000000000000000000000000000000000', 16)
-const pow29 = new BN('010000000000000000000000000000000000000000000000000000000000', 16)
-const pow28 = new BN('0100000000000000000000000000000000000000000000000000000000', 16)
-const pow27 = new BN('01000000000000000000000000000000000000000000000000000000', 16)
-const pow26 = new BN('010000000000000000000000000000000000000000000000000000', 16)
-const pow25 = new BN('0100000000000000000000000000000000000000000000000000', 16)
-const pow24 = new BN('01000000000000000000000000000000000000000000000000', 16)
-const pow23 = new BN('010000000000000000000000000000000000000000000000', 16)
-const pow22 = new BN('0100000000000000000000000000000000000000000000', 16)
-const pow21 = new BN('01000000000000000000000000000000000000000000', 16)
-const pow20 = new BN('010000000000000000000000000000000000000000', 16)
-const pow19 = new BN('0100000000000000000000000000000000000000', 16)
-const pow18 = new BN('01000000000000000000000000000000000000', 16)
-const pow17 = new BN('010000000000000000000000000000000000', 16)
-const pow16 = new BN('0100000000000000000000000000000000', 16)
-const pow15 = new BN('01000000000000000000000000000000', 16)
-const pow14 = new BN('010000000000000000000000000000', 16)
-const pow13 = new BN('0100000000000000000000000000', 16)
-const pow12 = new BN('01000000000000000000000000', 16)
-const pow11 = new BN('010000000000000000000000', 16)
-const pow10 = new BN('0100000000000000000000', 16)
-const pow9 = new BN('01000000000000000000', 16)
-const pow8 = new BN('010000000000000000', 16)
-const pow7 = new BN('0100000000000000', 16)
-const pow6 = new BN('01000000000000', 16)
-const pow5 = new BN('010000000000', 16)
-const pow4 = new BN('0100000000', 16)
-const pow3 = new BN('01000000', 16)
-const pow2 = new BN('010000', 16)
-const pow1 = new BN('0100', 16)
-
-module.exports = function (a) {
-  if (a.cmp(pow1) === -1) {
-    return 0
-  } else if (a.cmp(pow2) === -1) {
-    return 1
-  } else if (a.cmp(pow3) === -1) {
-    return 2
-  } else if (a.cmp(pow4) === -1) {
-    return 3
-  } else if (a.cmp(pow5) === -1) {
-    return 4
-  } else if (a.cmp(pow6) === -1) {
-    return 5
-  } else if (a.cmp(pow7) === -1) {
-    return 6
-  } else if (a.cmp(pow8) === -1) {
-    return 7
-  } else if (a.cmp(pow9) === -1) {
-    return 8
-  } else if (a.cmp(pow10) === -1) {
-    return 9
-  } else if (a.cmp(pow11) === -1) {
-    return 10
-  } else if (a.cmp(pow12) === -1) {
-    return 11
-  } else if (a.cmp(pow13) === -1) {
-    return 12
-  } else if (a.cmp(pow14) === -1) {
-    return 13
-  } else if (a.cmp(pow15) === -1) {
-    return 14
-  } else if (a.cmp(pow16) === -1) {
-    return 15
-  } else if (a.cmp(pow17) === -1) {
-    return 16
-  } else if (a.cmp(pow18) === -1) {
-    return 17
-  } else if (a.cmp(pow19) === -1) {
-    return 18
-  } else if (a.cmp(pow20) === -1) {
-    return 19
-  } else if (a.cmp(pow21) === -1) {
-    return 20
-  } else if (a.cmp(pow22) === -1) {
-    return 21
-  } else if (a.cmp(pow23) === -1) {
-    return 22
-  } else if (a.cmp(pow24) === -1) {
-    return 23
-  } else if (a.cmp(pow25) === -1) {
-    return 24
-  } else if (a.cmp(pow26) === -1) {
-    return 25
-  } else if (a.cmp(pow27) === -1) {
-    return 26
-  } else if (a.cmp(pow28) === -1) {
-    return 27
-  } else if (a.cmp(pow29) === -1) {
-    return 28
-  } else if (a.cmp(pow30) === -1) {
-    return 29
-  } else if (a.cmp(pow31) === -1) {
-    return 30
-  } else if (a.cmp(pow32) === -1) {
-    return 31
-  } else {
-    return 32
-  }
-}
-
-},{"ethereumjs-util":66}],8:[function(require,module,exports){
-(function (Buffer){
-const async = require('async')
-const fees = require('ethereum-common')
-const utils = require('ethereumjs-util')
-const BN = utils.BN
-const constants = require('./constants.js')
-const logTable = require('./logTable.js')
-const ERROR = constants.ERROR
-const MAX_INT = 9007199254740991
-
-// the opcode functions
-module.exports = {
-  STOP: function (runState) {
-    runState.stopped = true
-  },
-  ADD: function (a, b, runState) {
-    return new Buffer(
-      new BN(a)
-        .add(new BN(b))
-        .mod(utils.TWO_POW256)
-        .toArray())
-  },
-  MUL: function (a, b, runState) {
-    return new Buffer(
-      new BN(a)
-        .mul(new BN(b))
-        .mod(utils.TWO_POW256)
-        .toArray()
-    )
-  },
-  SUB: function (a, b, runState) {
-    return utils.toUnsigned(
-      new BN(a)
-        .sub(new BN(b))
-    )
-  },
-  DIV: function (a, b, runState) {
-    a = new BN(a)
-    b = new BN(b)
-    var r
-    if (b.isZero()) {
-      r = [0]
-    } else {
-      r = a.div(b).toArray()
-    }
-    return new Buffer(r)
-  },
-  SDIV: function (a, b, runState) {
-    a = utils.fromSigned(a)
-    b = utils.fromSigned(b)
-
-    var r
-    if (b.isZero()) {
-      r = new Buffer([0])
-    } else {
-      r = utils.toUnsigned(a.div(b))
-    }
-
-    return r
-  },
-  MOD: function (a, b, runState) {
-    a = new BN(a)
-    b = new BN(b)
-    var r
-
-    if (b.isZero()) {
-      r = [0]
-    } else {
-      r = a.mod(b).toArray()
-    }
-
-    return new Buffer(r)
-  },
-  SMOD: function (a, b, runState) {
-    a = utils.fromSigned(a)
-    b = utils.fromSigned(b)
-    var r
-
-    if (b.isZero()) {
-      r = new Buffer([0])
-    } else {
-      r = a.abs().mod(b.abs())
-      if (a.isNeg()) {
-        r = r.neg()
-      }
-
-      r = utils.toUnsigned(r)
-    }
-    return r
-  },
-  ADDMOD: function (a, b, c, runState) {
-    a = new BN(a).add(new BN(b))
-    c = new BN(c)
-    var r
-
-    if (c.isZero()) {
-      r = [0]
-    } else {
-      r = a.mod(c).toArray()
-    }
-
-    return new Buffer(r)
-  },
-  MULMOD: function (a, b, c, runState) {
-    a = new BN(a).mul(new BN(b))
-    c = new BN(c)
-    var r
-
-    if (c.isZero()) {
-      r = [0]
-    } else {
-      r = a.mod(c).toArray()
-    }
-
-    return new Buffer(r)
-  },
-  EXP: function (base, exponent, runState) {
-    base = new BN(base)
-    exponent = new BN(exponent)
-    var m = BN.red(utils.TWO_POW256)
-    var result
-
-    base = base.toRed(m)
-
-    if (!exponent.isZero()) {
-      var bytes = 1 + logTable(exponent)
-      subGas(runState, new BN(bytes).muln(fees.expByteGas.v))
-      result = new Buffer(base.redPow(exponent).toArray())
-    } else {
-      result = new Buffer([1])
-    }
-
-    return result
-  },
-  SIGNEXTEND: function (k, runState) {
-    k = new BN(k)
-    var extendOnes = false
-
-    if (k.cmpn(31) <= 0) {
-      k = k.toNumber()
-
-      var val = new Buffer(utils.setLengthLeft(runState.stack.pop(), 32))
-
-      if (val[31 - k] & 0x80) {
-        extendOnes = true
-      }
-
-      // 31-k-1 since k-th byte shouldn't be modified
-      for (var i = 30 - k; i >= 0; i--) {
-        val[i] = extendOnes ? 0xff : 0
-      }
-
-      return val
-    }
-  },
-  // 0x10 range - bit ops
-  LT: function (a, b, runState) {
-    return new Buffer([
-      new BN(a)
-        .cmp(new BN(b)) === -1
-    ])
-  },
-  GT: function (a, b, runState) {
-    return new Buffer([
-      new BN(a)
-        .cmp(new BN(b)) === 1
-    ])
-  },
-  SLT: function (a, b, runState) {
-    runState.stack.push(
-      new Buffer([
-        utils.fromSigned(a)
-          .cmp(utils.fromSigned(b)) === -1
-      ])
-    )
-  },
-  SGT: function (a, b, runState) {
-    return new Buffer([
-      utils.fromSigned(a)
-        .cmp(utils.fromSigned(b)) === 1
-    ])
-  },
-  EQ: function (a, b, runState) {
-    a = utils.unpad(a)
-    b = utils.unpad(b)
-    return new Buffer([a.toString('hex') === b.toString('hex')])
-  },
-  ISZERO: function (a, runState) {
-    a = utils.bufferToInt(a)
-    return new Buffer([!a])
-  },
-  AND: function (a, b, runState) {
-    return new Buffer((
-    new BN(a)
-      .and(
-        new BN(b)
-    )
-      )
-      .toArray())
-  },
-  OR: function (a, b, runState) {
-    return new Buffer((
-    new BN(a)
-      .or(
-        new BN(b)
-    )
-      )
-      .toArray())
-  },
-  XOR: function (a, b, runState) {
-    return new Buffer((
-    new BN(a)
-      .xor(
-        new BN(b)
-    )
-      )
-      .toArray())
-  },
-  NOT: function (a, runState) {
-    return new Buffer(new BN(a).inotn(256).toArray())
-  },
-  BYTE: function (pos, word, runState) {
-    pos = utils.bufferToInt(pos)
-    word = utils.setLengthLeft(word, 32)
-    var byte
-
-    if (pos < 32) {
-      byte = utils.intToBuffer(word[pos])
-    } else {
-      byte = new Buffer([0])
-    }
-
-    return byte
-  },
-  // 0x20 range - crypto
-  SHA3: function (offset, length, runState) {
-    offset = utils.bufferToInt(offset)
-    length = utils.bufferToInt(length)
-    var data = memLoad(runState, offset, length)
-    // copy fee
-    subGas(runState, new BN(fees.sha3WordGas.v).imuln(Math.ceil(length / 32)))
-    return utils.sha3(data)
-  },
-  // 0x30 range - closure state
-  ADDRESS: function (runState) {
-    return runState.address
-  },
-  BALANCE: function (address, runState, cb) {
-    var stateManager = runState.stateManager
-    // stack to address
-    address = utils.setLengthLeft(address.slice(-20), 20)
-
-    // shortcut if current account
-    if (address.toString('hex') === runState.address.toString('hex')) {
-      cb(null, runState.contract.balance)
-      return
-    }
-
-    // otherwise load account then return balance
-    stateManager.getAccountBalance(address, cb)
-  },
-  ORIGIN: function (runState) {
-    return runState.origin
-  },
-  CALLER: function (runState) {
-    return runState.caller
-  },
-  CALLVALUE: function (runState) {
-    return runState.callValue
-  },
-  CALLDATALOAD: function (pos, runState) {
-    pos = utils.bufferToInt(pos)
-    var loaded = runState.callData.slice(pos, pos + 32)
-
-    loaded = loaded.length ? loaded : new Buffer([0])
-
-    return utils.setLengthRight(loaded, 32)
-  },
-  CALLDATASIZE: function (runState) {
-    if (runState.callData.length === 1 && runState.callData[0] === 0) {
-      return new Buffer([0])
-    } else {
-      return utils.intToBuffer(runState.callData.length)
-    }
-  },
-  CALLDATACOPY: function (memOffset, dataOffsetBuf, dataLength, runState) {
-    memOffset = utils.bufferToInt(memOffset)
-    dataLength = utils.bufferToInt(dataLength)
-    var dataOffset = utils.bufferToInt(dataOffsetBuf)
-
-    memStore(runState, memOffset, runState.callData, dataOffset, dataLength)
-    // sub the COPY fee
-    subGas(runState, new BN(Number(fees.copyGas.v) * Math.ceil(dataLength / 32)))
-  },
-  CODESIZE: function (runState) {
-    return utils.intToBuffer(runState.code.length)
-  },
-  CODECOPY: function (memOffset, codeOffset, length, runState) {
-    memOffset = utils.bufferToInt(memOffset)
-    codeOffset = utils.bufferToInt(codeOffset)
-    length = utils.bufferToInt(length)
-
-    memStore(runState, memOffset, runState.code, codeOffset, length)
-    // sub the COPY fee
-    subGas(runState, new BN(fees.copyGas.v * Math.ceil(length / 32)))
-  },
-  EXTCODESIZE: function (address, runState, cb) {
-    var stateManager = runState.stateManager
-    address = address.slice(-20)
-    stateManager.getContractCode(address, function (err, code) {
-      cb(err, utils.intToBuffer(code.length))
-    })
-  },
-  EXTCODECOPY: function (address, memOffset, codeOffset, length, runState, cb) {
-    var stateManager = runState.stateManager
-    address = address.slice(-20)
-    memOffset = utils.bufferToInt(memOffset)
-    codeOffset = utils.bufferToInt(codeOffset)
-    length = utils.bufferToInt(length)
-    subMemUsage(runState, memOffset, length)
-
-    // copy fee
-    subGas(runState, new BN(fees.copyGas.v).imuln(Math.ceil(length / 32)))
-
-    stateManager.getContractCode(address, function (err, code) {
-      code = err ? new Buffer([0]) : code
-      memStore(runState, memOffset, code, codeOffset, length, false)
-      cb(err)
-    })
-  },
-  GASPRICE: function (runState) {
-    runState.stack.push(runState.gasPrice)
-  },
-  // '0x40' range - block operations
-  BLOCKHASH: function (number, runState, cb) {
-    var stateManager = runState.stateManager
-    number = utils.bufferToInt(number)
-    var diff = utils.bufferToInt(runState.block.header.number) - utils.bufferToInt(number)
-
-    // block lookups must be within the past 256 blocks
-    if (diff > 256 || diff <= 0) {
-      cb(null, new Buffer([0]))
-      return
-    }
-
-    stateManager.getBlockHash(number, function (err, blockHash) {
-      if (err) {
-        // if we are at a low block height and request a blockhash before the genesis block
-        cb(null, new Buffer([0]))
-      } else {
-        cb(null, blockHash)
-      }
-    })
-  },
-  COINBASE: function (runState) {
-    return runState.block.header.coinbase
-  },
-  TIMESTAMP: function (runState) {
-    return runState.block.header.timestamp
-  },
-  NUMBER: function (runState) {
-    return runState.block.header.number
-  },
-  DIFFICULTY: function (runState) {
-    return runState.block.header.difficulty
-  },
-  GASLIMIT: function (runState) {
-    return runState.block.header.gasLimit
-  },
-  // 0x50 range - 'storage' and execution
-  POP: function () {},
-  MLOAD: function (pos, runState) {
-    pos = utils.bufferToInt(pos)
-    var loaded = utils.unpad(memLoad(runState, pos, 32))
-    return loaded
-  },
-  MSTORE: function (offset, word, runState) {
-    offset = utils.bufferToInt(offset)
-    word = utils.setLengthLeft(word, 32)
-    memStore(runState, offset, word, 0, 32)
-  },
-  MSTORE8: function (offset, byte, runState) {
-    offset = utils.bufferToInt(offset)
-    // grab the last byte
-    byte = byte.slice(byte.length - 1)
-    memStore(runState, offset, byte, 0, 1)
-  },
-  SLOAD: function (key, runState, cb) {
-    var stateManager = runState.stateManager
-    key = utils.setLengthLeft(key, 32)
-
-    stateManager.getContractStorage(runState.address, key, function (err, value) {
-      if (err) return cb(err)
-      value = value.length ? value : new Buffer([0])
-      cb(null, value)
-    })
-  },
-  SSTORE: function (key, val, runState, cb) {
-    var stateManager = runState.stateManager
-    var address = runState.address
-    key = utils.setLengthLeft(key, 32)
-    var value = utils.unpad(val)
-
-    stateManager.getContractStorage(runState.address, key, function (err, found) {
-      if (err) return cb(err)
-      try {
-        if (value.length === 0 && !found.length) {
-          subGas(runState, new BN(fees.sstoreResetGas.v))
-        } else if (value.length === 0 && found.length) {
-          subGas(runState, new BN(fees.sstoreResetGas.v))
-          runState.gasRefund.iadd(new BN(fees.sstoreRefundGas.v))
-        } else if (value.length !== 0 && !found.length) {
-          subGas(runState, new BN(fees.sstoreSetGas.v))
-        } else if (value.length !== 0 && found.length) {
-          subGas(runState, new BN(fees.sstoreResetGas.v))
-        }
-      } catch (e) {
-        cb(e.error)
-        return
-      }
-
-      stateManager.putContractStorage(address, key, value, function (err) {
-        if (err) return cb(err)
-        runState.contract = stateManager.cache.get(address)
-        cb()
-      })
-    })
-  },
-  JUMP: function (dest, runState) {
-    dest = utils.bufferToInt(dest)
-
-    if (!jumpIsValid(runState, dest)) {
-      trap(ERROR.INVALID_JUMP)
-    }
-
-    runState.programCounter = dest
-  },
-  JUMPI: function (c, i, runState) {
-    c = utils.bufferToInt(c)
-    i = utils.bufferToInt(i)
-
-    var dest = i ? c : runState.programCounter
-
-    if (i && !jumpIsValid(runState, dest)) {
-      trap(ERROR.INVALID_JUMP)
-    }
-
-    runState.programCounter = dest
-  },
-  PC: function (runState) {
-    return utils.intToBuffer(runState.programCounter - 1)
-  },
-  MSIZE: function (runState) {
-    return utils.intToBuffer(runState.memoryWordCount * 32)
-  },
-  GAS: function (runState) {
-    return new Buffer(runState.gasLeft.toArray())
-  },
-  JUMPDEST: function (runState) {},
-  PUSH: function (runState) {
-    var numToPush = runState.opCode - 0x5f
-    var loaded = utils.unpad(runState.code.slice(runState.programCounter, runState.programCounter + numToPush))
-    runState.programCounter += numToPush
-    return loaded
-  },
-  DUP: function (runState) {
-    const stackPos = runState.opCode - 0x7f
-
-    if (stackPos > runState.stack.length) {
-      trap(ERROR.STACK_UNDERFLOW)
-    }
-
-    // dupilcated stack items point to the same Buffer
-    return runState.stack[runState.stack.length - stackPos]
-  },
-  SWAP: function (runState) {
-    var stackPos = runState.opCode - 0x8f
-
-    // check the stack to make sure we have enough items on teh stack
-    var swapIndex = runState.stack.length - stackPos - 1
-    if (swapIndex < 0) {
-      trap(ERROR.STACK_UNDERFLOW)
-    }
-
-    // preform the swap
-    var newTop = runState.stack[swapIndex]
-    runState.stack[swapIndex] = runState.stack.pop()
-    return newTop
-  },
-  LOG: function (memOffset, memLength) {
-    var args = Array.prototype.slice.call(arguments, 0)
-    args.pop() // pop off callback
-    var runState = args.pop()
-    var topics = args.slice(2)
-    topics = topics.map(function (a) {
-      return utils.setLengthLeft(a, 32)
-    })
-
-    memOffset = utils.bufferToInt(memOffset)
-    memLength = utils.bufferToInt(memLength)
-    const numOfTopics = runState.opCode - 0xa0
-    const mem = memLoad(runState, memOffset, memLength)
-    subGas(runState, new BN(numOfTopics * fees.logTopicGas.v + memLength * fees.logDataGas.v))
-
-    // add address
-    var log = [runState.address]
-    log.push(topics)
-
-    // add data
-    log.push(mem)
-    runState.logs.push(log)
-  },
-
-  // '0xf0' range - closures
-  CREATE: function (value, offset, length, runState, done) {
-    value = new BN(value)
-    offset = utils.bufferToInt(offset)
-    length = utils.bufferToInt(length)
-    // set up config
-    var options = {
-      value: value
-    }
-    var localOpts = {
-      inOffset: offset,
-      inLength: length
-    }
-
-    checkCallMemCost(runState, options, localOpts)
-    makeCall(runState, options, localOpts, done)
-  },
-  CALL: function (gasLimit, toAddress, value, inOffset, inLength, outOffset, outLength, runState, done) {
-    var stateManager = runState.stateManager
-    gasLimit = new BN(gasLimit)
-    toAddress = utils.setLengthLeft(toAddress, 20)
-    value = new BN(value)
-    inOffset = utils.bufferToInt(inOffset)
-    inLength = utils.bufferToInt(inLength)
-    outOffset = utils.bufferToInt(outOffset)
-    outLength = utils.bufferToInt(outLength)
-    var data = memLoad(runState, inOffset, inLength)
-    var options = {
-      gasLimit: gasLimit,
-      value: value,
-      to: toAddress,
-      data: data
-    }
-    var localOpts = {
-      inOffset: inOffset,
-      inLength: inLength,
-      outOffset: outOffset,
-      outLength: outLength
-    }
-
-    // add stipend
-    if (!value.isZero()) {
-      runState.gasLeft.iadd(new BN(fees.callStipend.v))
-      subGas(runState, new BN(fees.callValueTransferGas.v))
-      options.gasLimit.iadd(new BN(fees.callStipend.v))
-    }
-
-    checkCallMemCost(runState, options, localOpts)
-
-    stateManager.exists(toAddress, function (err, exists) {
-      if (err) {
-        done(err)
-        return
-      }
-      if (!exists) {
-        // can't wrap because we are in a callback
-        runState.gasLeft.isub(new BN(fees.callNewAccountGas.v))
-      }
-      makeCall(runState, options, localOpts, done)
-    })
-  },
-  CALLCODE: function (gas, toAddress, value, inOffset, inLength, outOffset, outLength, runState, done) {
-    var stateManager = runState.stateManager
-    gas = new BN(gas)
-    toAddress = utils.setLengthLeft(toAddress, 20)
-    value = new BN(value)
-    inOffset = utils.bufferToInt(inOffset)
-    inLength = utils.bufferToInt(inLength)
-    outOffset = utils.bufferToInt(outOffset)
-    outLength = utils.bufferToInt(outLength)
-
-    const options = {
-      gasLimit: gas,
-      value: value,
-      to: runState.address
-    }
-
-    const localOpts = {
-      inOffset: inOffset,
-      inLength: inLength,
-      outOffset: outOffset,
-      outLength: outLength
-    }
-
-    // add stipend
-    if (!value.isZero()) {
-      runState.gasLeft.isub(new BN(fees.callValueTransferGas.v)).iadd(new BN(fees.callStipend.v))
-      options.gasLimit.iadd(new BN(fees.callStipend.v))
-    }
-
-    checkCallMemCost(runState, options, localOpts)
-
-    // load the code
-    stateManager.getAccount(toAddress, function (err, account) {
-      if (err) return done(err)
-      if (utils.isPrecompiled(toAddress)) {
-        options.compiled = true
-        options.code = runState._precompiled[toAddress.toString('hex')]
-        makeCall(runState, options, localOpts, done)
-      } else {
-        stateManager.getContractCode(toAddress, function (err, code, compiled) {
-          if (err) return done(err)
-          options.code = code
-          options.compiled = compiled
-          makeCall(runState, options, localOpts, done)
-        })
-      }
-    })
-  },
-  DELEGATECALL: function (gas, toAddress, inOffset, inLength, outOffset, outLength, runState, done) {
-    var stateManager = runState.stateManager
-    var value = runState.callValue
-    gas = new BN(gas)
-    toAddress = utils.setLengthLeft(toAddress, 20)
-    inOffset = utils.bufferToInt(inOffset)
-    inLength = utils.bufferToInt(inLength)
-    outOffset = utils.bufferToInt(outOffset)
-    outLength = utils.bufferToInt(outLength)
-
-    const options = {
-      gasLimit: gas,
-      value: value,
-      to: runState.address,
-      caller: runState.caller
-    }
-
-    const localOpts = {
-      inOffset: inOffset,
-      inLength: inLength,
-      outOffset: outOffset,
-      outLength: outLength
-    }
-
-    checkCallMemCost(runState, options, localOpts)
-
-    // load the code
-    stateManager.getAccount(toAddress, function (err, account) {
-      if (err) return done(err)
-      if (utils.isPrecompiled(toAddress)) {
-        options.compiled = true
-        options.code = runState._precompiled[toAddress.toString('hex')]
-        makeCall(runState, options, localOpts, done)
-      } else {
-        stateManager.getContractCode(toAddress, function (err, code, compiled) {
-          if (err) return done(err)
-          options.code = code
-          options.compiled = compiled
-          makeCall(runState, options, localOpts, done)
-        })
-      }
-    })
-  },
-  RETURN: function (offset, length, runState) {
-    offset = utils.bufferToInt(offset)
-    length = utils.bufferToInt(length)
-    runState.returnValue = memLoad(runState, offset, length)
-  },
-  // '0x70', range - other
-  SUICIDE: function (suicideToAddress, runState, cb) {
-    var stateManager = runState.stateManager
-    var contract = runState.contract
-    var contractAddress = runState.address
-    suicideToAddress = utils.setLengthLeft(suicideToAddress, 20)
-
-    // only add to refund if this is the first suicide for the address
-    if (!runState.suicides[contractAddress.toString('hex')]) {
-      runState.gasRefund = runState.gasRefund.add(new BN(fees.suicideRefundGas.v))
-    }
-
-    runState.suicideTo = suicideToAddress
-    runState.suicides[contractAddress.toString('hex')] = suicideToAddress
-    runState.stopped = true
-
-    stateManager.getAccount(suicideToAddress, function (err, toAccount) {
-      // update balances
-      if (err) {
-        cb(err)
-        return
-      }
-      var newBalance = new Buffer(new BN(contract.balance).add(new BN(toAccount.balance)).toArray())
-      async.series([
-        stateManager.putAccountBalance.bind(stateManager, suicideToAddress, newBalance),
-        stateManager.putAccountBalance.bind(stateManager, contractAddress, new BN(0))
-      ], cb)
-    })
-  }
-}
-
-module.exports._DC = module.exports.DELEGATECALL
-
-function subGas (runState, amount) {
-  runState.gasLeft.isub(amount)
-  if (runState.gasLeft.cmpn(0) === -1) {
-    trap(ERROR.OUT_OF_GAS)
-  }
-}
-
-function trap (err) {
-  function VmError (error) {
-    this.error = error
-  }
-  throw new VmError(err)
-}
-
-/**
- * Subtracts the amount needed for memory usage from `runState.gasLeft`
- * @method subMemUsage
- * @param {Number} offset
- * @param {Number} length
- * @return {String}
- */
-function subMemUsage (runState, offset, length) {
-  //  abort if no usage
-  if (!length) return
-
-  // hacky: if the dataOffset is larger than the largest safeInt then just
-  // load 0's because if tx.data did have that amount of data then the fee
-  // would be high than the maxGasLimit in the block
-  if (offset > MAX_INT || length > MAX_INT) {
-    trap(ERROR.OUT_OF_GAS)
-  }
-
-  var newMemoryWordCount = Math.ceil((offset + length) / 32)
-  runState.memoryWordCount = Math.max(newMemoryWordCount, runState.memoryWordCount)
-  var words = new BN(newMemoryWordCount)
-  var fee = new BN(fees.memoryGas.v)
-  var quadCoeff = new BN(fees.quadCoeffDiv.v)
-  var cost = words.mul(fee).add(words.mul(words).div(quadCoeff))
-
-  if (cost.cmp(runState.highestMemCost) === 1) {
-    subGas(runState, cost.sub(runState.highestMemCost))
-    runState.highestMemCost = cost
-  }
-}
-
-/**
- * Loads bytes from memory and returns them as a buffer. If an error occurs
- * a string is instead returned. The function also subtracts the amount of
- * gas need for memory expansion.
- * @method memLoad
- * @param {Number} offset where to start reading from
- * @param {Number} length how far to read
- * @return {Buffer|String}
- */
-function memLoad (runState, offset, length) {
-  // check to see if we have enougth gas for the mem read
-  subMemUsage(runState, offset, length)
-  var loaded = runState.memory.slice(offset, offset + length)
-  // fill the remaining lenth with zeros
-  for (var i = loaded.length; i < length; i++) {
-    loaded.push(0)
-  }
-  return new Buffer(loaded)
-}
-
-/**
- * Stores bytes to memory. If an error occurs a string is instead returned.
- * The function also subtracts the amount of gas need for memory expansion.
- * @method memStore
- * @param {Number} offset where to start reading from
- * @param {Number} length how far to read
- * @return {Buffer|String}
- */
-function memStore (runState, offset, val, valOffset, length, skipSubMem) {
-  if (skipSubMem !== false) {
-    subMemUsage(runState, offset, length)
-  }
-
-  for (var i = 0; i < length; i++) {
-    runState.memory[offset + i] = val[valOffset + i]
-  }
-}
-
-// checks if a jump is valid given a destination
-function jumpIsValid (runState, dest) {
-  return runState.validJumps.indexOf(dest) !== -1
-}
-
-// checks to see if we have enough gas left for the memory reads and writes
-// required by the CALLs
-function checkCallMemCost (runState, callOptions, localOpts) {
-  // calculates the gase need for reading the input from memory
-  callOptions.data = memLoad(runState, localOpts.inOffset, localOpts.inLength)
-
-  // calculates the gas need for saving the output in memory
-  if (localOpts.outLength) {
-    subMemUsage(runState, localOpts.outOffset, localOpts.outLength)
-  }
-
-  if (!callOptions.gasLimit) {
-    callOptions.gasLimit = runState.gasLeft
-  }
-
-  if (runState.gasLeft.cmp(callOptions.gasLimit) === -1) {
-    trap(ERROR.OUT_OF_GAS)
-  }
-}
-
-// sets up and calls runCall
-function makeCall (runState, callOptions, localOpts, cb) {
-  callOptions.caller = callOptions.caller || runState.address
-  callOptions.origin = runState.origin
-  callOptions.gasPrice = runState.gasPrice
-  callOptions.block = runState.block
-  callOptions.populateCache = false
-  callOptions.suicides = runState.suicides
-
-  // increment the runState.depth
-  callOptions.depth = runState.depth + 1
-
-  // check if account has enough ether
-  if (runState.depth >= fees.stackLimit.v || new BN(runState.contract.balance).cmp(callOptions.value) === -1) {
-    runState.stack.push(new Buffer([0]))
-    cb()
-  } else {
-    // if creating a new contract then increament the nonce
-    if (!callOptions.to) {
-      runState.contract.nonce = new BN(runState.contract.nonce).addn(1)
-    }
-
-    runState.stateManager.cache.put(runState.address, runState.contract)
-    runState._vm.runCall(callOptions, parseCallResults)
-  }
-
-  function parseCallResults (err, results) {
-    // concat the runState.logs
-    if (results.vm.logs) {
-      runState.logs = runState.logs.concat(results.vm.logs)
-    }
-
-    // add gasRefund
-    if (results.vm.gasRefund) {
-      runState.gasRefund = runState.gasRefund.add(results.vm.gasRefund)
-    }
-
-    // this should always be safe
-    runState.gasLeft.isub(results.gasUsed)
-
-    if (!results.vm.exceptionError) {
-      // save results to memory
-      if (results.vm.return) {
-        for (var i = 0; i < Math.min(localOpts.outLength, results.vm.return.length); i++) {
-          runState.memory[localOpts.outOffset + i] = results.vm.return[i]
-        }
-      }
-
-      // update stateRoot on current contract
-      runState.stateManager.getAccount(runState.address, function (err, account) {
-        runState.contract = account
-        // push the created address to the stack
-        if (results.createdAddress) {
-          cb(err, results.createdAddress)
-        } else {
-          cb(err, new Buffer([results.vm.exception]))
-        }
-      })
-    } else {
-      // creation failed so don't increament the nonce
-      if (results.vm.createdAddress) {
-        runState.contract.nonce = new BN(runState.contract.nonce).subn(1)
-      }
-
-      cb(err, new Buffer([results.vm.exception]))
-    }
-  }
-}
-
-}).call(this,require("buffer").Buffer)
-},{"./constants.js":4,"./logTable.js":7,"async":30,"buffer":179,"ethereum-common":59,"ethereumjs-util":66}],9:[function(require,module,exports){
-const codes = {
-  // 0x0 range - arithmetic ops
-  // name, baseCost, off stack, on stack, dynamic
-  0x00: ['STOP', 0, 0, 0, false],
-  0x01: ['ADD', 3, 2, 1, false],
-  0x02: ['MUL', 5, 2, 1, false],
-  0x03: ['SUB', 3, 2, 1, false],
-  0x04: ['DIV', 5, 2, 1, false],
-  0x05: ['SDIV', 5, 2, 1, false],
-  0x06: ['MOD', 5, 2, 1, false],
-  0x07: ['SMOD', 5, 2, 1, false],
-  0x08: ['ADDMOD', 8, 3, 1, false],
-  0x09: ['MULMOD', 8, 3, 1, false],
-  0x0a: ['EXP', 10, 2, 1, false],
-  0x0b: ['SIGNEXTEND', 5, 1, 1, false],
-
-  // 0x10 range - bit ops
-  0x10: ['LT', 3, 2, 1, false],
-  0x11: ['GT', 3, 2, 1, false],
-  0x12: ['SLT', 3, 2, 1, false],
-  0x13: ['SGT', 3, 2, 1, false],
-  0x14: ['EQ', 3, 2, 1, false],
-  0x15: ['ISZERO', 3, 1, 1, false],
-  0x16: ['AND', 3, 2, 1, false],
-  0x17: ['OR', 3, 2, 1, false],
-  0x18: ['XOR', 3, 2, 1, false],
-  0x19: ['NOT', 3, 1, 1, false],
-  0x1a: ['BYTE', 3, 2, 1, false],
-
-  // 0x20 range - crypto
-  0x20: ['SHA3', 30, 2, 1, false],
-
-  // 0x30 range - closure state
-  0x30: ['ADDRESS', 2, 0, 1, true],
-  0x31: ['BALANCE', 20, 1, 1, true],
-  0x32: ['ORIGIN', 2, 0, 1, true],
-  0x33: ['CALLER', 2, 0, 1, true],
-  0x34: ['CALLVALUE', 2, 0, 1, true],
-  0x35: ['CALLDATALOAD', 3, 1, 1, true],
-  0x36: ['CALLDATASIZE', 2, 0, 1, true],
-  0x37: ['CALLDATACOPY', 3, 3, 0, true],
-  0x38: ['CODESIZE', 2, 0, 1, false],
-  0x39: ['CODECOPY', 3, 3, 0, false],
-  0x3a: ['GASPRICE', 2, 0, 1, false],
-  0x3b: ['EXTCODESIZE', 20, 1, 1, true],
-  0x3c: ['EXTCODECOPY', 20, 4, 0, true],
-
-  // '0x40' range - block operations
-  0x40: ['BLOCKHASH', 20, 1, 1, true],
-  0x41: ['COINBASE', 2, 0, 1, true],
-  0x42: ['TIMESTAMP', 2, 0, 1, true],
-  0x43: ['NUMBER', 2, 0, 1, true],
-  0x44: ['DIFFICULTY', 2, 0, 1, true],
-  0x45: ['GASLIMIT', 2, 0, 1, true],
-
-  // 0x50 range - 'storage' and execution
-  0x50: ['POP', 2, 1, 0, false],
-  0x51: ['MLOAD', 3, 1, 1, false],
-  0x52: ['MSTORE', 3, 2, 0, false],
-  0x53: ['MSTORE8', 3, 2, 0, false],
-  0x54: ['SLOAD', 50, 1, 1, true],
-  0x55: ['SSTORE', 0, 2, 0, true],
-  0x56: ['JUMP', 8, 1, 0, false],
-  0x57: ['JUMPI', 10, 2, 0, false],
-  0x58: ['PC', 2, 0, 1, false],
-  0x59: ['MSIZE', 2, 0, 1, false],
-  0x5a: ['GAS', 2, 0, 1, false],
-  0x5b: ['JUMPDEST', 1, 0, 0, false],
-
-  // 0x60, range
-  0x60: ['PUSH', 3, 0, 1, false],
-  0x61: ['PUSH', 3, 0, 1, false],
-  0x62: ['PUSH', 3, 0, 1, false],
-  0x63: ['PUSH', 3, 0, 1, false],
-  0x64: ['PUSH', 3, 0, 1, false],
-  0x65: ['PUSH', 3, 0, 1, false],
-  0x66: ['PUSH', 3, 0, 1, false],
-  0x67: ['PUSH', 3, 0, 1, false],
-  0x68: ['PUSH', 3, 0, 1, false],
-  0x69: ['PUSH', 3, 0, 1, false],
-  0x6a: ['PUSH', 3, 0, 1, false],
-  0x6b: ['PUSH', 3, 0, 1, false],
-  0x6c: ['PUSH', 3, 0, 1, false],
-  0x6d: ['PUSH', 3, 0, 1, false],
-  0x6e: ['PUSH', 3, 0, 1, false],
-  0x6f: ['PUSH', 3, 0, 1, false],
-  0x70: ['PUSH', 3, 0, 1, false],
-  0x71: ['PUSH', 3, 0, 1, false],
-  0x72: ['PUSH', 3, 0, 1, false],
-  0x73: ['PUSH', 3, 0, 1, false],
-  0x74: ['PUSH', 3, 0, 1, false],
-  0x75: ['PUSH', 3, 0, 1, false],
-  0x76: ['PUSH', 3, 0, 1, false],
-  0x77: ['PUSH', 3, 0, 1, false],
-  0x78: ['PUSH', 3, 0, 1, false],
-  0x79: ['PUSH', 3, 0, 1, false],
-  0x7a: ['PUSH', 3, 0, 1, false],
-  0x7b: ['PUSH', 3, 0, 1, false],
-  0x7c: ['PUSH', 3, 0, 1, false],
-  0x7d: ['PUSH', 3, 0, 1, false],
-  0x7e: ['PUSH', 3, 0, 1, false],
-  0x7f: ['PUSH', 3, 0, 1, false],
-
-  0x80: ['DUP', 3, 0, 1, false],
-  0x81: ['DUP', 3, 0, 1, false],
-  0x82: ['DUP', 3, 0, 1, false],
-  0x83: ['DUP', 3, 0, 1, false],
-  0x84: ['DUP', 3, 0, 1, false],
-  0x85: ['DUP', 3, 0, 1, false],
-  0x86: ['DUP', 3, 0, 1, false],
-  0x87: ['DUP', 3, 0, 1, false],
-  0x88: ['DUP', 3, 0, 1, false],
-  0x89: ['DUP', 3, 0, 1, false],
-  0x8a: ['DUP', 3, 0, 1, false],
-  0x8b: ['DUP', 3, 0, 1, false],
-  0x8c: ['DUP', 3, 0, 1, false],
-  0x8d: ['DUP', 3, 0, 1, false],
-  0x8e: ['DUP', 3, 0, 1, false],
-  0x8f: ['DUP', 3, 0, 1, false],
-
-  0x90: ['SWAP', 3, 0, 0, false],
-  0x91: ['SWAP', 3, 0, 0, false],
-  0x92: ['SWAP', 3, 0, 0, false],
-  0x93: ['SWAP', 3, 0, 0, false],
-  0x94: ['SWAP', 3, 0, 0, false],
-  0x95: ['SWAP', 3, 0, 0, false],
-  0x96: ['SWAP', 3, 0, 0, false],
-  0x97: ['SWAP', 3, 0, 0, false],
-  0x98: ['SWAP', 3, 0, 0, false],
-  0x99: ['SWAP', 3, 0, 0, false],
-  0x9a: ['SWAP', 3, 0, 0, false],
-  0x9b: ['SWAP', 3, 0, 0, false],
-  0x9c: ['SWAP', 3, 0, 0, false],
-  0x9d: ['SWAP', 3, 0, 0, false],
-  0x9e: ['SWAP', 3, 0, 0, false],
-  0x9f: ['SWAP', 3, 0, 0, false],
-
-  0xa0: ['LOG', 375, 2, 0, false],
-  0xa1: ['LOG', 375, 3, 0, false],
-  0xa2: ['LOG', 375, 4, 0, false],
-  0xa3: ['LOG', 375, 5, 0, false],
-  0xa4: ['LOG', 375, 6, 0, false],
-
-  // '0xf0' range - closures
-  0xf0: ['CREATE', 32000, 3, 1, true],
-  0xf1: ['CALL', 40, 7, 1, true],
-  0xf2: ['CALLCODE', 40, 7, 1, true],
-  0xf3: ['RETURN', 0, 2, 0, false],
-  0xf4: ['DELEGATECALL', 40, 6, 1, true],
-
-  // '0x70', range - other
-  0xff: ['SUICIDE', 0, 1, 0, false]
-}
-
-module.exports = function (op, full) {
-  var code = codes[op] ? codes[op] : ['INVALID', 0]
-  var opcode = code[0]
-
-  if (full) {
-    if (opcode === 'LOG') {
-      opcode += op - 0xa0
-    }
-
-    if (opcode === 'PUSH') {
-      opcode += op - 0x5f
-    }
-
-    if (opcode === 'DUP') {
-      opcode += op - 0x7f
-    }
-
-    if (opcode === 'SWAP') {
-      opcode += op - 0x8f
-    }
-  }
-
-  return {name: opcode, fee: code[1], in: code[2], out: code[3], dynamic: code[4], async: code[5]}
-}
-
-},{}],10:[function(require,module,exports){
-const utils = require('ethereumjs-util')
-const BN = utils.BN
-const error = require('../constants.js').ERROR
-const fees = require('ethereum-common')
-
-module.exports = function (opts) {
-  var results = {}
-
-  results.gasUsed = new BN(fees.ecrecoverGas.v)
-
-  if (opts.gasLimit.cmp(results.gasUsed) === -1) {
-    results.gasUsed = opts.gasLimit
-    results.exception = 0 // 0 means VM fail (in this case because of OOG)
-    results.exceptionError = error.OUT_OF_GAS
-    return results
-  }
-
-  var data = utils.setLengthRight(opts.data, 128)
-
-  var msgHash = data.slice(0, 32)
-  var v = data.slice(32, 64)
-  var r = data.slice(64, 96)
-  var s = data.slice(96, 128)
-
-  var publicKey
-  try {
-    publicKey = utils.ecrecover(msgHash, v, r, s)
-  } catch (e) {
-    return results
-  }
-
-  results.return = utils.setLengthLeft(utils.publicToAddress(publicKey), 32)
-  results.exception = 1
-
-  return results
-}
-
-},{"../constants.js":4,"ethereum-common":59,"ethereumjs-util":66}],11:[function(require,module,exports){
-const utils = require('ethereumjs-util')
-const BN = utils.BN
-const error = require('../constants.js').ERROR
-const fees = require('ethereum-common')
-
-module.exports = function (opts) {
-  var results = {}
-  var data = opts.data
-
-  results.gasUsed = new BN(fees.sha256Gas.v)
-  results.gasUsed.iadd(new BN(fees.sha256WordGas.v).imuln(Math.ceil(data.length / 32)))
-
-  if (opts.gasLimit.cmp(results.gasUsed) === -1) {
-    results.gasUsed = opts.gasLimit
-    results.exceptionError = error.OUT_OF_GAS
-    results.exception = 0 // 0 means VM fail (in this case because of OOG)
-    return results
-  }
-
-  results.return = utils.sha256(data)
-  results.exception = 1
-
-  return results
-}
-
-},{"../constants.js":4,"ethereum-common":59,"ethereumjs-util":66}],12:[function(require,module,exports){
-const utils = require('ethereumjs-util')
-const BN = utils.BN
-const error = require('../constants.js').ERROR
-const fees = require('ethereum-common')
-
-module.exports = function (opts) {
-  var results = {}
-  var data = opts.data
-
-  results.gasUsed = new BN(fees.ripemd160Gas.v)
-  results.gasUsed.iadd(new BN(fees.ripemd160WordGas.v).imuln(Math.ceil(data.length / 32)))
-
-  if (opts.gasLimit.cmp(results.gasUsed) === -1) {
-    results.gasUsed = opts.gasLimit
-    results.exceptionError = error.OUT_OF_GAS
-    results.exception = 0 // 0 means VM fail (in this case because of OOG)
-    return results
-  }
-
-  results.return = utils.ripemd160(data, true)
-  results.exception = 1
-
-  return results
-}
-
-},{"../constants.js":4,"ethereum-common":59,"ethereumjs-util":66}],13:[function(require,module,exports){
-const utils = require('ethereumjs-util')
-const BN = utils.BN
-const fees = require('ethereum-common')
-const error = require('../constants.js').ERROR
-
-module.exports = function (opts) {
-  var results = {}
-  var data = opts.data
-
-  results.gasUsed = new BN(fees.identityGas.v)
-  results.gasUsed.iadd(new BN(fees.identityWordGas.v).imuln(Math.ceil(data.length / 32)))
-
-  if (opts.gasLimit.cmp(results.gasUsed) === -1) {
-    results.gasUsed = opts.gasLimit
-    results.exceptionError = error.OUT_OF_GAS
-    results.exception = 0 // 0 means VM fail (in this case because of OOG)
-    return results
-  }
-
-  results.return = data
-  results.exception = 1
-
-  return results
-}
-
-},{"../constants.js":4,"ethereum-common":59,"ethereumjs-util":66}],14:[function(require,module,exports){
-(function (Buffer){
-const async = require('async')
-const ethUtil = require('ethereumjs-util')
-const Bloom = require('./bloom.js')
-const common = require('ethereum-common')
-const rlp = ethUtil.rlp
-const Trie = require('merkle-patricia-tree')
-const BN = ethUtil.BN
-
-const minerReward = new BN(common.minerReward.v)
-const niblingReward = new BN(common.niblingReward.v)
-const ommerReward = new BN(common.ommerReward.v)
-
-/**
- * process the transaction in a block and pays the miners
- * @param opts
- * @param opts.block {Block} the block we are processing
- * @param opts.generate {Boolean} [gen=false] whether to generate the stateRoot
- * @param cb {Function} the callback which is given an error string
- */
-module.exports = function (opts, cb) {
-  const self = this
-
-  // parse options
-  const block = opts.block
-  const generateStateRoot = !!opts.generate
-  const validateStateRoot = !generateStateRoot
-  const bloom = new Bloom()
-  const receiptTrie = new Trie()
-  // the total amount of gas used processing this block
-  var gasUsed = new BN(0)
-  // miner account
-  var minerAccount
-  var receipts = []
-  var txResults = []
-  var result
-
-  if (opts.root) {
-    self.stateManager.trie.root = opts.root
-  }
-
-  this.trie.checkpoint()
-
-  // run everything
-  async.series([
-    beforeBlock,
-    populateCache,
-    processTransactions
-  ], parseBlockResults)
-
-  function beforeBlock (cb) {
-    self.emit('beforeBlock', opts.block, cb)
-  }
-
-  function afterBlock (cb) {
-    self.emit('afterBlock', result, cb)
-  }
-
-  // populates the cache with accounts that we know we will need
-  function populateCache (cb) {
-    var accounts = new Set()
-    accounts.add(block.header.coinbase.toString('hex'))
-    block.transactions.forEach(function (tx) {
-      accounts.add(tx.getSenderAddress().toString('hex'))
-      accounts.add(tx.to.toString('hex'))
-    })
-
-    block.uncleHeaders.forEach(function (uh) {
-      accounts.add(uh.coinbase.toString('hex'))
-    })
-
-    self.populateCache(accounts, cb)
-  }
-
-  /**
-   * Processes all of the transaction in the block
-   * @method processTransaction
-   * @param {Function} cb the callback is given error if there are any
-   */
-  function processTransactions (cb) {
-    var validReceiptCount = 0
-
-    async.eachSeries(block.transactions, processTx, cb)
-
-    function processTx (tx, cb) {
-      var gasLimitIsHigherThanBlock = new BN(block.header.gasLimit).cmp(new BN(tx.gasLimit).add(gasUsed)) === -1
-      if (gasLimitIsHigherThanBlock) {
-        cb('tx has a higher gas limit than the block')
-        return
-      }
-
-      // run the tx through the VM
-      self.runTx({
-        tx: tx,
-        block: block,
-        populateCache: false
-      }, parseTxResult)
-
-      function parseTxResult (err, result) {
-        txResults.push(result)
-
-        // abort if error
-        if (err) {
-          receipts.push(null)
-          cb(err)
-          return
-        }
-
-        gasUsed = gasUsed.add(result.gasUsed)
-        // combine blooms via bitwise OR
-        bloom.or(result.bloom)
-
-        if (generateStateRoot) {
-          block.header.bloom = bloom.bitvector
-        }
-
-        var txLogs = result.vm.logs || []
-        var rawTxReceipt = [
-          self.trie.root,
-          new Buffer(gasUsed.toArray()),
-          result.bloom.bitvector,
-          txLogs
-        ]
-        var txReceipt = {
-          stateRoot: rawTxReceipt[0],
-          gasUsed: rawTxReceipt[1],
-          bitvector: rawTxReceipt[2],
-          logs: rawTxReceipt[3]
-        }
-
-        receipts.push(txReceipt)
-        receiptTrie.put(rlp.encode(validReceiptCount), rlp.encode(rawTxReceipt))
-        validReceiptCount++
-        cb()
-      }
-    }
-  }
-
-  // handle results or error from block run
-  function parseBlockResults (err) {
-    if (err) {
-      self.trie.revert()
-      cb(err)
-      return
-    }
-
-    // credit all block rewards
-    payOmmersAndMiner()
-
-    // credit all block rewards
-    if (generateStateRoot) {
-      block.header.stateRoot = self.trie.root
-    }
-
-    self.trie.commit(function (err) {
-      self.stateManager.cache.flush(function () {
-        if (validateStateRoot) {
-          if (receiptTrie.root && receiptTrie.root.toString('hex') !== block.header.receiptTrie.toString('hex')) {
-            err = (err || '') + 'invalid receiptTrie '
-          }
-          if (bloom.bitvector.toString('hex') !== block.header.bloom.toString('hex')) {
-            err = (err || '') + 'invalid bloom '
-          }
-          if (ethUtil.bufferToInt(block.header.gasUsed) !== Number(gasUsed)) {
-            err = (err || '') + 'invalid gasUsed '
-          }
-          if (self.trie.root.toString('hex') !== block.header.stateRoot.toString('hex')) {
-            err = (err || '') + 'invalid block stateRoot '
-          }
-        }
-
-        self.stateManager.cache.clear()
-
-        result = {
-          receipts: receipts,
-          results: txResults,
-          error: err
-        }
-
-        afterBlock(cb.bind(this, err, result))
-      })
-    })
-  }
-
-  // credit all block rewards
-  function payOmmersAndMiner () {
-    var ommers = block.uncleHeaders
-    // pay each ommer
-    ommers.forEach(rewardOmmer)
-    // calculate nibling reward
-    var totalNiblingReward = niblingReward.mul(new BN(ommers.length))
-    minerAccount = self.stateManager.cache.get(block.header.coinbase)
-    // give miner the block reward
-    minerAccount.balance = new BN(minerAccount.balance)
-      .add(minerReward)
-      .add(totalNiblingReward)
-    self.stateManager.cache.put(block.header.coinbase, minerAccount)
-  }
-
-  // credit ommer
-  function rewardOmmer (ommer) {
-    // calculate reward
-    var heightDiff = new BN(block.header.number).sub(new BN(ommer.number))
-    var reward = minerReward.sub(ommerReward.mul(heightDiff))
-    // credit miners account
-    var ommerAccount = self.stateManager.cache.get(ommer.coinbase)
-    ommerAccount.balance = reward.add(new BN(ommerAccount.balance))
-    self.stateManager.cache.put(ommer.coinbase, ommerAccount)
-  }
-}
-
-}).call(this,require("buffer").Buffer)
-},{"./bloom.js":2,"async":30,"buffer":179,"ethereum-common":59,"ethereumjs-util":66,"merkle-patricia-tree":105}],15:[function(require,module,exports){
-const async = require('async')
-
-/**
- * processes blocks and adds them to the blockchain
- * @method onBlock
- * @param blockchain
- */
-module.exports = function (blockchain, cb) {
-  var self = this
-  var headBlock, parentState
-
-  // parse arguments
-  if (typeof blockchain === 'function') {
-    cb = blockchain
-  } else if (blockchain) {
-    self.blockchain = blockchain
-  }
-
-  // setup blockchain iterator
-  this.stateManager.blockchain.iterator('vm', processBlock, cb)
-  function processBlock (block, reorg, cb) {
-    async.series([
-      getStartingState,
-      runBlock
-    ], cb)
-
-    // determine starting state for block run
-    function getStartingState (cb) {
-      // if we are just starting or if a chain re-org has happened
-      if (!headBlock || reorg) {
-        self.stateManager.blockchain.getBlock(block.header.parentHash, function (err, parentBlock) {
-          parentState = parentBlock.header.stateRoot
-          // generate genesis state if we are at the genesis block
-          // we don't have the genesis state
-          if (!headBlock) {
-            return self.stateManager.generateCanonicalGenesis(cb)
-          } else {
-            cb(err)
-          }
-        })
-      } else {
-        parentState = headBlock.header.stateRoot
-        cb()
-      }
-    }
-
-    // run block, update head if valid
-    function runBlock (cb) {
-      self.runBlock({
-        block: block,
-        root: parentState
-      }, function (err, results) {
-        if (err) {
-          // remove invalid block
-          self.stateManager.blockchain.delBlock(block, cb)
-        } else {
-          // set as new head block
-          headBlock = block
-          cb()
-        }
-      })
-    }
-  }
-}
-
-},{"async":30}],16:[function(require,module,exports){
-(function (Buffer){
-const async = require('async')
-const ethUtil = require('ethereumjs-util')
-const BN = ethUtil.BN
-const fees = require('ethereum-common')
-const constants = require('./constants.js')
-
-const ERROR = constants.ERROR
-
-/**
- * runs a CALL operation
- * @method runCall
- * @param opts
- * @param opts.block {Block}
- * @param opts.caller {Buffer}
- * @param opts.code {Buffer} this is for CALLCODE where the code to load is different than the code from the to account.
- * @param opts.data {Buffer}
- * @param opts.gasLimit {Buffer | BN.js }
- * @param opts.gasPrice {Buffer}
- * @param opts.origin {Buffer} []
- * @param opts.to {Buffer}
- * @param opts.value {Buffer}
- */
-module.exports = function (opts, cb) {
-  var self = this
-  var stateManager = self.stateManager
-
-  var vmResults = {}
-  var toAccount
-  var toAddress = opts.to
-  var createdAddress
-  var txValue = opts.value || new Buffer(0)
-  var caller = opts.caller
-  var account = stateManager.cache.get(caller)
-  var block = opts.block
-  var code = opts.code
-  var txData = opts.data
-  var gasLimit = opts.gasLimit || new BN(0xffffff)
-  gasLimit = new BN(opts.gasLimit) // make sure is a BN
-  var gasPrice = opts.gasPrice
-  var gasUsed = new BN(0)
-  var origin = opts.origin
-  var isCompiled = opts.compiled
-  var depth = opts.depth
-  var suicides = opts.suicides
-
-  txValue = new BN(txValue)
-
-  stateManager.checkpoint()
-
-  // run and parse
-  subTxValue()
-
-  async.series([
-    loadToAccount,
-    loadCode,
-    runCode,
-    saveCode
-  ], parseCallResult)
-
-  function loadToAccount (done) {
-    // get receiver's account
-    // toAccount = stateManager.cache.get(toAddress)
-    if (!toAddress) {
-      // generate a new contract if no `to`
-      code = txData
-      txData = undefined
-      var newNonce = new BN(account.nonce).subn(1)
-      createdAddress = toAddress = ethUtil.generateAddress(caller, newNonce.toArray())
-      stateManager.getAccount(createdAddress, function (err, account) {
-        toAccount = account
-        done(err)
-      })
-    } else {
-      // else load the `to` account
-      toAccount = stateManager.cache.get(toAddress)
-      done()
-    }
-  }
-
-  function subTxValue () {
-    account.balance = new BN(account.balance).sub(txValue)
-    stateManager.cache.put(caller, account)
-  }
-
-  function addTxValue () {
-    // add the amount sent to the `to` account
-    toAccount.balance = new BN(toAccount.balance).add(txValue)
-    stateManager.cache.put(toAddress, toAccount)
-  }
-
-  function loadCode (cb) {
-    addTxValue()
-    // loads the contract's code if the account is a contract
-    if (code || !(toAccount.isContract() || ethUtil.isPrecompiled(toAddress))) {
-      cb()
-      return
-    }
-
-    if (ethUtil.isPrecompiled(toAddress)) {
-      isCompiled = true
-      code = self._precompiled[toAddress.toString('hex')]
-      cb()
-      return
-    }
-
-    stateManager.getContractCode(toAddress, function (err, c, comp) {
-      if (err) return cb(err)
-      isCompiled = comp
-      code = c
-      cb()
-    })
-  }
-
-  function runCode (cb) {
-    if (!code) {
-      vmResults.exception = 1
-      stateManager.commit(cb)
-      return
-    }
-
-    var runCodeOpts = {
-      code: code,
-      data: txData,
-      gasLimit: gasLimit,
-      gasPrice: gasPrice,
-      address: toAddress,
-      origin: origin,
-      caller: caller,
-      value: new Buffer(txValue.toArray()),
-      block: block,
-      depth: depth,
-      suicides: suicides,
-      populateCache: false
-    }
-
-    // run Code through vm
-    var codeRunner = isCompiled ? self.runJIT : self.runCode
-    codeRunner.call(self, runCodeOpts, parseRunResult)
-
-    function parseRunResult (err, results) {
-      toAccount = self.stateManager.cache.get(toAddress)
-      vmResults = results
-
-      if (createdAddress) {
-        // fee for size of the return value
-        var returnFee = results.return.length * fees.createDataGas.v
-        var totalGas = results.gasUsed.addn(returnFee)
-        // if not enough gas
-        if (totalGas.cmp(gasLimit) <= 0) {
-          results.gasUsed = totalGas
-        } else {
-          results.return = new Buffer([])
-          if (opts.block.isHomestead()) {
-            results.exception = 0
-            err = results.exceptionError = ERROR.OUT_OF_GAS
-            results.gasUsed = gasLimit
-          }
-        }
-      }
-
-      gasUsed = results.gasUsed
-      if (err) {
-        results.logs = []
-        stateManager.revert(cb)
-      } else {
-        stateManager.commit(cb)
-      }
-    }
-  }
-
-  function saveCode (cb) {
-    // store code for a new contract
-    if (createdAddress && vmResults.return.toString() !== '') {
-      stateManager.putContractCode(createdAddress, vmResults.return, cb)
-    } else {
-      cb()
-    }
-  }
-
-  function parseCallResult (err) {
-    if (err) return cb(err)
-    var results = {
-      gasUsed: gasUsed,
-      createdAddress: createdAddress,
-      vm: vmResults
-    }
-
-    cb(null, results)
-  }
-}
-
-}).call(this,require("buffer").Buffer)
-},{"./constants.js":4,"async":30,"buffer":179,"ethereum-common":59,"ethereumjs-util":66}],17:[function(require,module,exports){
-(function (Buffer){
-/*
-
-This is the core of the Ethereum Virtual Machine (EVM or just VM).
-
-NOTES:
-
-stack items are lazly dupilicated.
-So you must never directly change a buffer from the stack,
-instead you should `copy` it first
-
-not all stack items are 32 bytes, so if the operation realies on the stack
-item length then you must use utils.pad(<item>, 32) first.
-
-*/
-const async = require('async')
-const utils = require('ethereumjs-util')
-const Block = require('ethereumjs-block')
-const lookupOpInfo = require('./opcodes.js')
-const opFns = require('./opFns.js')
-const constants = require('./constants.js')
-const setImmediate = require('timers').setImmediate
-const BN = utils.BN
-
-const ERROR = constants.ERROR
-
-/**
- * Runs EVM code
- * @param opts
- * @param opts.account {Account} the account that the exucuting code belongs to
- * @param opts.address {Buffer}  the address of the account that is exucuting this code
- * @param opts.block {Block} the block that the transaction is part of
- * @param opts.caller {Buffer} the address that ran this code
- * @param opts.code {Buffer} the code to be run
- * @param opts.data {Buffer}  the input data
- * @param opts.gasLimit {Buffer}
- * @param opts.origin {Buffer} the address where the call originated from
- * @param opts.value {Buffer} the amount the being transfered
- * @param cb {Function}
- */
-module.exports = function (opts, cb) {
-  var self = this
-  var stateManager = self.stateManager
-
-  // VM internal state
-  var runState = {
-    stateManager: stateManager,
-    returnValue: false,
-    stopped: false,
-    vmError: false,
-    suicideTo: undefined,
-    programCounter: 0,
-    opCode: undefined,
-    opName: undefined,
-    gasLeft: new BN(opts.gasLimit),
-    gasLimit: new BN(opts.gasLimit),
-    gasPrice: opts.gasPrice,
-    memory: [],
-    memoryWordCount: 0,
-    stack: [],
-    logs: [],
-    validJumps: [],
-    gasRefund: new BN(0),
-    highestMemCost: new BN(0),
-    depth: opts.depth || 0,
-    suicides: opts.suicides || {},
-    block: opts.block || new Block(),
-    callValue: opts.value || new BN(0),
-    address: opts.address || utils.zeros(32),
-    caller: opts.caller || utils.zeros(32),
-    origin: opts.origin || opts.caller || utils.zeros(32),
-    callData: opts.data || new Buffer([0]),
-    code: opts.code,
-    populateCache: opts.populateCache === undefined ? true : opts.populateCache
-  }
-
-  // temporary - to be factored out
-  runState._precompiled = self._precompiled
-  runState._vm = self
-
-  if (!runState.block.isHomestead()) {
-    delete opFns.DELEGATECALL
-  } else {
-    opFns.DELEGATECALL = opFns._DC
-  }
-
-  // prepare to run vm
-  preprocessValidJumps(runState)
-  // load contract then start vm run
-  loadContract(runVm)
-
-  // iterate through the given ops until something breaks or we hit STOP
-  function runVm () {
-    async.whilst(vmIsActive, iterateVm, parseVmResults)
-  }
-
-  // ensure contract is loaded; only used if runCode is called directly
-  function loadContract (cb) {
-    stateManager.getAccount(runState.address, function (err, account) {
-      if (err) return cb(err)
-      runState.contract = account
-      cb()
-    })
-  }
-
-  function vmIsActive () {
-    var notAtEnd = runState.programCounter < runState.code.length
-    return !runState.stopped && notAtEnd && !runState.vmError && !runState.returnValue
-  }
-
-  function iterateVm (done) {
-    if (runState.stack.length > 1024) {
-      return done(ERROR.INVALID_OPCODE)
-    }
-
-    var opCode = runState.code[runState.programCounter]
-    var opInfo = lookupOpInfo(opCode)
-    var opName = opInfo.name
-    var opFn = opFns[opName]
-
-    runState.opName = opName
-    runState.opCode = opCode
-
-    // check for invalid opcode
-    if (opName === 'INVALID') {
-      return done(ERROR.INVALID_OPCODE)
-    }
-
-    // check for stack underflows
-    if (runState.stack.length < opInfo.in) {
-      return done(ERROR.STACK_UNDERFLOW)
-    }
-
-    async.series([
-      runStepHook,
-      runOp
-    ], function (err) {
-      setImmediate(done.bind(null, err))
-    })
-
-    function runStepHook (cb) {
-      var eventObj = {
-        pc: runState.programCounter,
-        gasLeft: runState.gasLeft,
-        opcode: lookupOpInfo(opCode, true),
-        stack: runState.stack,
-        depth: runState.depth,
-        address: runState.address,
-        account: runState.contract,
-        cache: runState.stateManager.cache,
-        memory: runState.memory
-      }
-      self.emit('step', eventObj, cb)
-    }
-
-    function runOp (cb) {
-      // calculate gas
-      var fee = new BN(opInfo.fee)
-      // TODO: move to a shared funtion; subGas in opFuns
-      runState.gasLeft = runState.gasLeft.sub(fee)
-      if (runState.gasLeft.cmpn(0) === -1) {
-        runState.vmError = ERROR.OUT_OF_GAS
-        cb()
-        return
-      }
-      // advance program counter
-      runState.programCounter++
-      var argsNum = opInfo.in
-      // pop the stack
-      var args = argsNum ? runState.stack.splice(-opInfo.in) : []
-      args.reverse()
-      args.push(runState)
-      // create a callback for async opFunc
-      args.push(function (err, val) {
-        // save result to the stack
-        if (val) {
-          runState.stack.push(val)
-        }
-        cb(err)
-      })
-      try {
-        // run the opcode
-        var result = opFn.apply(null, args)
-      } catch (e) {
-        runState.vmError = e.error
-        cb()
-        return
-      }
-
-      // save result to the stack
-      if (result) {
-        runState.stack.push(result)
-      }
-      // call the callback if opFn was sync
-      if (opFn.length - argsNum !== 2) {
-        cb()
-      }
-    }
-  }
-
-  function parseVmResults (err) {
-    err = runState.vmError || err
-
-    // remove any logs on error
-    if (err) {
-      runState.logs = []
-      stateManager.revertContracts()
-    }
-
-    var results = {
-      suicides: runState.suicides,
-      suicideTo: runState.suicideTo,
-      gasRefund: runState.gasRefund,
-      exception: err ? true : false,
-      exceptionError: err,
-      logs: runState.logs,
-      gas: runState.gasLeft,
-      'return': runState.returnValue ? runState.returnValue : new Buffer([])
-    }
-
-    if (results.exceptionError) {
-      delete results.gasRefund
-    }
-
-    if (err) {
-      results.gasUsed = runState.gasLimit
-    } else {
-      results.gasUsed = runState.gasLimit.sub(runState.gasLeft)
-    }
-
-    if (runState.populateCache) {
-      self.stateManager.cache.flush(function () {
-        self.stateManager.cache.clear()
-        cb(err, results)
-      })
-    } else {
-      cb(err, results)
-    }
-  }
-}
-
-// find all the valid jumps and puts them in the `validJumps` array
-function preprocessValidJumps (runState) {
-  for (var i = 0; i < runState.code.length; i++) {
-    var curOpCode = lookupOpInfo(runState.code[i]).name
-
-    // no destinations into the middle of PUSH
-    if (curOpCode === 'PUSH') {
-      i += runState.code[i] - 0x5f
-    }
-
-    if (curOpCode === 'JUMPDEST') {
-      runState.validJumps.push(i)
-    }
-  }
-}
-
-}).call(this,require("buffer").Buffer)
-},{"./constants.js":4,"./opFns.js":8,"./opcodes.js":9,"async":30,"buffer":179,"ethereumjs-block":63,"ethereumjs-util":66,"timers":266}],18:[function(require,module,exports){
-module.exports = function (opts, cb) {
-  // for precompiled
-  var results
-  if (typeof opts.code === 'function') {
-    results = opts.code(opts)
-    results.account = opts.account
-    if (results.exception === undefined) {
-      results.exception = 1
-    }
-    cb(results.exceptionError, results)
-  } else {
-    var f = new Function('require', 'opts', opts.code.toString()) // eslint-disable-line
-    results = f(require, opts)
-    results.account = opts.account
-    cb(results.exceptionError, results)
-  }
-}
-
-},{}],19:[function(require,module,exports){
-(function (Buffer){
-const async = require('async')
-const utils = require('ethereumjs-util')
-const BN = utils.BN
-const Bloom = require('./bloom.js')
-const Block = require('ethereumjs-block')
-
-/**
- * Process a transaction. Run the vm. Transfers eth. checks balaces
- * @method processTx
- * @param opts
- * @param opts.tx {Transaciton} - a transaction
- * @param opts.skipNonce - skips the nonce check
- * @param opts.skipBalance - skips the balance check
- * @param opts.block {Block} needed to process the transaction, if no block is given a default one is created
- * @param cb {Function} - the callback
- */
-module.exports = function (opts, cb) {
-  var self = this
-  var block = opts.block
-  var tx = opts.tx
-  var gasLimit
-  var results
-  var basefee
-
-  // create a reasonable default if no block is given
-  if (!block) {
-    block = new Block()
-  }
-
-  if (new BN(block.header.gasLimit).cmp(new BN(tx.gasLimit)) === -1) {
-    cb(new Error('tx has a higher gas limit than the block'))
-    return
-  }
-
-  if (opts.populateCache === undefined) {
-    opts.populateCache = true
-  }
-
-  // run everything
-  async.series([
-    populateCache,
-    runTxHook,
-    runCall,
-    saveTries,
-    runAfterTxHook,
-    function (cb) {
-      self.stateManager.cache.flush(function () {
-        if (opts.populateCache) {
-          self.stateManager.cache.clear()
-        }
-        cb()
-      })
-    }
-  ], function (err) {
-    cb(err, results)
-  })
-
-  // run the transaction hook
-  function runTxHook (cb) {
-    self.emit('beforeTx', tx, cb)
-  }
-
-  // run the transaction hook
-  function runAfterTxHook (cb) {
-    self.emit('afterTx', results, cb)
-  }
-
-  /**
-   * populates the cache with the two and from of the tx
-   */
-  function populateCache (cb) {
-    var accounts = new Set()
-    accounts.add(tx.from.toString('hex'))
-    accounts.add(tx.to.toString('hex'))
-    accounts.add(block.header.coinbase.toString('hex'))
-
-    if (opts.populateCache === false) {
-      return cb()
-    }
-
-    self.stateManager.warmCache(accounts, cb)
-  }
-
-  // sets up the envorment and runs a `call`
-  function runCall (cb) {
-    // check to the sender's account to make sure it has enought wei and the
-    // correct nonce
-    var fromAccount = self.stateManager.cache.get(tx.from)
-    var message
-
-    if (!opts.skipBalance && new BN(fromAccount.balance).cmp(tx.getUpfrontCost()) === -1) {
-      message = "sender doesn't have enough funds to send tx. The upfront cost is: " + tx.getUpfrontCost().toString() + ' and the sender\s account only has: ' + new BN(fromAccount.balance).toString()
-      cb(new Error(message))
-      return
-    } else if (!opts.skipNonce && new BN(fromAccount.nonce).cmp(new BN(tx.nonce)) !== 0) {
-      message = "the tx doesn't have the correct nonce. account has nonce of: " + new BN(fromAccount.nonce).toString() + ' tx has nonce of: ' + new BN(tx.nonce).toString()
-      cb(new Error(message))
-      return
-    }
-
-    // increment the nonce
-    fromAccount.nonce = new BN(fromAccount.nonce).addn(1)
-    basefee = tx.getBaseFee()
-    gasLimit = new BN(tx.gasLimit).sub(basefee)
-    fromAccount.balance = new BN(fromAccount.balance).sub(new BN(tx.gasLimit).mul(new BN(tx.gasPrice)))
-    self.stateManager.cache.put(tx.from, fromAccount)
-
-    var options = {
-      caller: tx.from,
-      gasLimit: gasLimit,
-      gasPrice: tx.gasPrice,
-      to: tx.to,
-      value: tx.value,
-      data: tx.data,
-      block: block,
-      populateCache: false
-    }
-
-    if (tx.to.toString('hex') === '') {
-      delete options.to
-    }
-
-    // run call
-    self.runCall(options, parseResults)
-
-    function parseResults (err, _results) {
-      if (err) return cb(err)
-      results = _results
-
-      // generate the bloom for the tx
-      results.bloom = txLogsBloom(results.vm.logs)
-      fromAccount = self.stateManager.cache.get(tx.from)
-
-      // caculate the totall gas used
-      results.gasUsed = results.gasUsed.add(basefee)
-
-      // refund the accoun.stateManagert
-      var gasRefund = results.vm.gasRefund
-      if (gasRefund) {
-        if (gasRefund.cmp(results.gasUsed.divn(2)) === -1) {
-          results.gasUsed.isub(gasRefund)
-        } else {
-          results.gasUsed.isub(results.gasUsed.divn(2))
-        }
-      }
-
-      results.amountSpent = results.gasUsed.mul(new BN(tx.gasPrice))
-      // refund the left over gas amount
-      fromAccount.balance = new BN(tx.gasLimit).sub(results.gasUsed)
-        .mul(new BN(tx.gasPrice))
-        .add(new BN(fromAccount.balance))
-
-      self.stateManager.cache.put(tx.from, fromAccount)
-
-      var minerAccount = self.stateManager.cache.get(block.header.coinbase)
-      // add the amount spent on gas to the miner's account
-      minerAccount.balance = new BN(minerAccount.balance)
-        .add(results.amountSpent)
-
-      // save the miner's account
-      self.stateManager.cache.put(block.header.coinbase, minerAccount)
-
-      if (!results.vm.suicides) {
-        results.vm.suicides = {}
-      }
-
-      var keys = Object.keys(results.vm.suicides)
-
-      keys.forEach(function (s) {
-        self.stateManager.cache.del(new Buffer(s, 'hex'))
-      })
-
-      cb()
-    }
-  }
-
-  function saveTries (cb) {
-    self.stateManager.commitContracts(cb)
-  }
-}
-
-/**
- * @method txLogsBloom
- */
-function txLogsBloom (logs) {
-  var bloom = new Bloom()
-  if (logs) {
-    for (var i = 0; i < logs.length; i++) {
-      var log = logs[i]
-      // add the address
-      bloom.add(log[0])
-      // add the topics
-      var topics = log[1]
-      for (var q = 0; q < topics.length; q++) {
-        bloom.add(topics[q])
-      }
-    }
-  }
-  return bloom
-}
-
-}).call(this,require("buffer").Buffer)
-},{"./bloom.js":2,"async":30,"buffer":179,"ethereumjs-block":63,"ethereumjs-util":66}],20:[function(require,module,exports){
-(function (Buffer){
-const Trie = require('merkle-patricia-tree/secure.js')
-const common = require('ethereum-common')
-const async = require('async')
-const Account = require('ethereumjs-account')
-const fakeBlockchain = require('./fakeBlockChain.js')
-const Cache = require('./cache.js')
-const utils = require('ethereumjs-util')
-const BN = utils.BN
-const rlp = utils.rlp
-
-module.exports = StateManager
-
-function StateManager (opts) {
-  var self = this
-
-  var trie = opts.trie
-  if (!trie) {
-    trie = new Trie(trie)
-  }
-
-  var blockchain = opts.blockchain
-  if (!blockchain) {
-    blockchain = fakeBlockchain
-  }
-
-  self.blockchain = blockchain
-  self.trie = trie
-  self._storageTries = {} // the storage trie cache
-  self.cache = new Cache(trie)
-}
-
-var proto = StateManager.prototype
-
-// gets the account from the cache, or triggers a lookup and stores
-// the result in the cache
-proto.getAccount = function (address, cb) {
-  this.cache.getOrLoad(address, cb)
-}
-
-// checks if an account exists
-proto.exists = function (address, cb) {
-  this.cache.getOrLoad(address, function (err, account) {
-    cb(err, account.exists)
-  })
-}
-
-// saves the account
-proto._putAccount = function (address, account, cb) {
-  var self = this
-  var addressHex = new Buffer(address, 'hex')
-  // TODO: dont save newly created accounts that have no balance
-  // if (toAccount.balance.toString('hex') === '00') {
-  // if they have money or a non-zero nonce or code, then write to tree
-  self.cache.put(addressHex, account)
-  // self.trie.put(addressHex, account.serialize(), cb)
-  cb()
-}
-
-proto.getAccountBalance = function (address, cb) {
-  var self = this
-  self.getAccount(address, function (err, account) {
-    if (err) return cb(err)
-    cb(null, account.balance)
-  })
-}
-
-proto.putAccountBalance = function (address, balance, cb) {
-  var self = this
-  self.getAccount(address, function (err, account) {
-    if (err) {
-      cb(err)
-    }
-    account.balance = balance
-    self._putAccount(address, account, cb)
-  })
-}
-
-// sets the contract code on the account
-proto.putContractCode = function (address, value, cb) {
-  var self = this
-  self.getAccount(address, function (err, account) {
-    if (err) {
-      cb(err)
-    }
-    // TODO: setCode use trie.setRaw which creates a storage leak
-    account.setCode(self.trie, value, function (err) {
-      if (err) return cb(err)
-      self._putAccount(address, account, cb)
-    })
-  })
-}
-
-// given an account object, returns the code
-proto.getContractCode = function (address, cb) {
-  var self = this
-  self.getAccount(address, function (err, account) {
-    if (err) return cb(err)
-    account.getCode(self.trie, cb)
-  })
-}
-
-// creates a storage trie from the primary storage trie
-proto._lookupStorageTrie = function (address, cb) {
-  var self = this
-  // from state trie
-  self.getAccount(address, function (err, account) {
-    if (err) return cb(err)
-    var storageTrie = self.trie.copy()
-    storageTrie.root = account.stateRoot
-    storageTrie._checkpoints = []
-    cb(null, storageTrie)
-  })
-}
-
-// gets the storage trie from the storage cache or does lookup
-proto._getStorageTrie = function (address, cb) {
-  var self = this
-  var storageTrie = self._storageTries[address.toString('hex')]
-  // from storage cache
-  if (storageTrie) {
-    cb(null, storageTrie)
-    return
-  }
-  // lookup from state
-  self._lookupStorageTrie(address, cb)
-}
-
-proto.getContractStorage = function (address, key, cb) {
-  var self = this
-  self._getStorageTrie(address, function (err, trie) {
-    if (err) return cb(err)
-    trie.get(key, function (err, value) {
-      if (err) return cb(err)
-      var decoded = rlp.decode(value)
-      cb(null, decoded)
-    })
-  })
-}
-
-proto.putContractStorage = function (address, key, value, cb) {
-  var self = this
-  self._getStorageTrie(address, function (err, storageTrie) {
-    if (err) return cb(err)
-
-    if (value && value.length) {
-      // format input
-      var encodedValue = rlp.encode(value)
-      storageTrie.put(key, encodedValue, finalize)
-    } else {
-      // deleting a value
-      storageTrie.del(key, finalize)
-    }
-
-    function finalize (err) {
-      if (err) return cb(err)
-      // update storage cache
-      self._storageTries[address.toString('hex')] = storageTrie
-      // update contract stateRoot
-      var contract = self.cache.get(address)
-      contract.stateRoot = storageTrie.root
-      self._putAccount(address, contract, cb)
-    }
-  })
-}
-
-proto.commitContracts = function (cb) {
-  var self = this
-  async.each(Object.keys(self._storageTries), function (address, cb) {
-    var trie = self._storageTries[address]
-    delete self._storageTries[address]
-    // TODO: this is broken on the block level; all the contracts get written to
-    // disk redardless of whether or not the block is valid
-    if (trie.isCheckpoint) {
-      trie.commit(cb)
-    } else {
-      cb()
-    }
-  }, cb)
-}
-
-proto.revertContracts = function () {
-  var self = this
-  self._storageTries = {}
-}
-
-//
-// blockchain
-//
-proto.getBlockHash = function (number, cb) {
-  var self = this
-  self.blockchain.getBlock(number, function (err, block) {
-    if (err) return cb(err)
-    var blockHash = block.hash()
-    cb(null, blockHash)
-  })
-}
-
-//
-// revision history
-//
-proto.checkpoint = function () {
-  var self = this
-  self.trie.checkpoint()
-  self.cache.checkpoint()
-}
-
-proto.commit = function (cb) {
-  var self = this
-  // setup trie checkpointing
-  self.trie.commit(function () {
-    // setup cache checkpointing
-    self.cache.commit()
-    cb()
-  })
-}
-
-proto.revert = function (cb) {
-  var self = this
-  // setup trie checkpointing
-  self.trie.revert()
-  // setup cache checkpointing
-  self.cache.revert()
-  cb()
-}
-
-//
-// cache stuff
-//
-proto.getStateRoot = function (cb) {
-  var self = this
-  self.cacheFlush(function (err) {
-    if (err) return cb(err)
-    var stateRoot = self.trie.root
-    cb(null, stateRoot)
-  })
-}
-
-/**
- * @param {Set} address
- * @param {cb} function
- */
-proto.warmCache = function (addresses, cb) {
-  this.cache.warm(addresses, cb)
-}
-
-proto.dumpStorage = function (address, cb) {
-  var self = this
-  self._getStorageTrie(address, function (err, trie) {
-    if (err) {
-      cb(err)
-    }
-    var storage = {}
-    var stream = trie.createReadStream()
-    stream.on('data', function (val) {
-      storage[val.key.toString('hex')] = val.value.toString('hex')
-    })
-    stream.on('end', function () {
-      cb(storage)
-    })
-  })
-}
-
-proto.hasGenesisState = function (cb) {
-  const root = common.genesisStateRoot.v
-  this.trie.checkRoot(root, cb)
-}
-
-proto.generateCanonicalGenesis = function (cb) {
-  var self = this
-
-  this.hasGenesisState(function (err, genesis) {
-    if (!genesis & !err) {
-      self.generateGenesis(common.genesisState, cb)
-    } else {
-      cb(err)
-    }
-  })
-}
-
-proto.generateGenesis = function (initState, cb) {
-  var self = this
-  var addresses = Object.keys(initState)
-  async.eachSeries(addresses, function (address, done) {
-    var account = new Account()
-    account.balance = new Buffer((new BN(initState[address])).toArray())
-    address = new Buffer(address, 'hex')
-    self.trie.put(address, account.serialize(), done)
-  }, cb)
-}
-
-}).call(this,require("buffer").Buffer)
-},{"./cache.js":3,"./fakeBlockChain.js":5,"async":30,"buffer":179,"ethereum-common":59,"ethereumjs-account":61,"ethereumjs-util":66,"merkle-patricia-tree/secure.js":108}],21:[function(require,module,exports){
+(function(f){if(typeof exports==="object"&&typeof module!=="undefined"){module.exports=f()}else if(typeof define==="function"&&define.amd){define([],f)}else{var g;if(typeof window!=="undefined"){g=window}else if(typeof global!=="undefined"){g=global}else if(typeof self!=="undefined"){g=self}else{g=this}g.EthJS = f()}})(function(){var define,module,exports;return (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
 (function (process){
 /* Copyright (c) 2013 Rod Vagg, MIT License */
 
@@ -2972,7 +81,7 @@ AbstractChainedBatch.prototype.write = function (options, callback) {
 
 module.exports = AbstractChainedBatch
 }).call(this,require('_process'))
-},{"_process":237}],22:[function(require,module,exports){
+},{"_process":243}],2:[function(require,module,exports){
 (function (process){
 /* Copyright (c) 2013 Rod Vagg, MIT License */
 
@@ -3025,7 +134,7 @@ AbstractIterator.prototype.end = function (callback) {
 module.exports = AbstractIterator
 
 }).call(this,require('_process'))
-},{"_process":237}],23:[function(require,module,exports){
+},{"_process":243}],3:[function(require,module,exports){
 (function (Buffer,process){
 /* Copyright (c) 2013 Rod Vagg, MIT License */
 
@@ -3301,13 +410,13 @@ AbstractLevelDOWN.prototype._checkKey = function (obj, type) {
 module.exports = AbstractLevelDOWN
 
 }).call(this,{"isBuffer":require("../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js")},require('_process'))
-},{"../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js":227,"./abstract-chained-batch":21,"./abstract-iterator":22,"_process":237,"xtend":26}],24:[function(require,module,exports){
+},{"../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js":233,"./abstract-chained-batch":1,"./abstract-iterator":2,"_process":243,"xtend":6}],4:[function(require,module,exports){
 exports.AbstractLevelDOWN    = require('./abstract-leveldown')
 exports.AbstractIterator     = require('./abstract-iterator')
 exports.AbstractChainedBatch = require('./abstract-chained-batch')
 exports.isLevelDOWN          = require('./is-leveldown')
 
-},{"./abstract-chained-batch":21,"./abstract-iterator":22,"./abstract-leveldown":23,"./is-leveldown":25}],25:[function(require,module,exports){
+},{"./abstract-chained-batch":1,"./abstract-iterator":2,"./abstract-leveldown":3,"./is-leveldown":5}],5:[function(require,module,exports){
 var AbstractLevelDOWN = require('./abstract-leveldown')
 
 function isLevelDOWN (db) {
@@ -3323,7 +432,7 @@ function isLevelDOWN (db) {
 
 module.exports = isLevelDOWN
 
-},{"./abstract-leveldown":23}],26:[function(require,module,exports){
+},{"./abstract-leveldown":3}],6:[function(require,module,exports){
 module.exports = extend
 
 var hasOwnProperty = Object.prototype.hasOwnProperty;
@@ -3344,12 +453,12 @@ function extend() {
     return target
 }
 
-},{}],27:[function(require,module,exports){
+},{}],7:[function(require,module,exports){
 'use strict';
 
 module.exports = require('./lib/AsyncEventEmitter');
 
-},{"./lib/AsyncEventEmitter":28}],28:[function(require,module,exports){
+},{"./lib/AsyncEventEmitter":8}],8:[function(require,module,exports){
 'use strict';
 
 var EventEmitter = require('events').EventEmitter,
@@ -3529,7 +638,7 @@ AsyncEventEmitter.prototype._beforeOrAfter = function(event, target, listener, b
   return this;
 };
 
-},{"async":29,"events":216,"util":269}],29:[function(require,module,exports){
+},{"async":9,"events":222,"util":275}],9:[function(require,module,exports){
 (function (process){
 /*global setImmediate: false, setTimeout: false, console: false */
 (function () {
@@ -4491,7 +1600,7 @@ AsyncEventEmitter.prototype._beforeOrAfter = function(event, target, listener, b
 }());
 
 }).call(this,require('_process'))
-},{"_process":237}],30:[function(require,module,exports){
+},{"_process":243}],10:[function(require,module,exports){
 (function (process,global){
 /*!
  * async
@@ -5760,7 +2869,7 @@ AsyncEventEmitter.prototype._beforeOrAfter = function(event, target, listener, b
 }());
 
 }).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"_process":237}],31:[function(require,module,exports){
+},{"_process":243}],11:[function(require,module,exports){
 (function (module, exports) {
   'use strict';
 
@@ -9180,7 +6289,7 @@ AsyncEventEmitter.prototype._beforeOrAfter = function(event, target, listener, b
   };
 })(typeof module === 'undefined' || module, this);
 
-},{}],32:[function(require,module,exports){
+},{}],12:[function(require,module,exports){
 var r;
 
 module.exports = function rand(len) {
@@ -9239,7 +6348,7 @@ if (typeof window === 'object') {
   }
 }
 
-},{}],33:[function(require,module,exports){
+},{}],13:[function(require,module,exports){
 (function (Buffer){
 const Sha3 = require('js-sha3')
 
@@ -9277,7 +6386,7 @@ module.exports = {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179,"js-sha3":76}],34:[function(require,module,exports){
+},{"buffer":185,"js-sha3":81}],14:[function(require,module,exports){
 (function (Buffer){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -9388,7 +6497,7 @@ function objectToString(o) {
 }
 
 }).call(this,{"isBuffer":require("../../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js")})
-},{"../../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js":227}],35:[function(require,module,exports){
+},{"../../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js":233}],15:[function(require,module,exports){
 var util = require('util')
   , AbstractIterator = require('abstract-leveldown').AbstractIterator
 
@@ -9424,7 +6533,7 @@ DeferredIterator.prototype._operation = function (method, args) {
 
 module.exports = DeferredIterator;
 
-},{"abstract-leveldown":24,"util":269}],36:[function(require,module,exports){
+},{"abstract-leveldown":4,"util":275}],16:[function(require,module,exports){
 (function (Buffer,process){
 var util              = require('util')
   , AbstractLevelDOWN = require('abstract-leveldown').AbstractLevelDOWN
@@ -9484,7 +6593,7 @@ module.exports                  = DeferredLevelDOWN
 module.exports.DeferredIterator = DeferredIterator
 
 }).call(this,{"isBuffer":require("../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js")},require('_process'))
-},{"../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js":227,"./deferred-iterator":35,"_process":237,"abstract-leveldown":24,"util":269}],37:[function(require,module,exports){
+},{"../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js":233,"./deferred-iterator":15,"_process":243,"abstract-leveldown":4,"util":275}],17:[function(require,module,exports){
 'use strict';
 
 var elliptic = exports;
@@ -9500,7 +6609,7 @@ elliptic.curves = require('./elliptic/curves');
 elliptic.ec = require('./elliptic/ec');
 elliptic.eddsa = require('./elliptic/eddsa');
 
-},{"../package.json":53,"./elliptic/curve":40,"./elliptic/curves":43,"./elliptic/ec":44,"./elliptic/eddsa":47,"./elliptic/hmac-drbg":50,"./elliptic/utils":52,"brorand":32}],38:[function(require,module,exports){
+},{"../package.json":33,"./elliptic/curve":20,"./elliptic/curves":23,"./elliptic/ec":24,"./elliptic/eddsa":27,"./elliptic/hmac-drbg":30,"./elliptic/utils":32,"brorand":12}],18:[function(require,module,exports){
 'use strict';
 
 var BN = require('bn.js');
@@ -9853,7 +6962,7 @@ BasePoint.prototype.dblp = function dblp(k) {
   return r;
 };
 
-},{"../../elliptic":37,"bn.js":31}],39:[function(require,module,exports){
+},{"../../elliptic":17,"bn.js":11}],19:[function(require,module,exports){
 'use strict';
 
 var curve = require('../curve');
@@ -10265,7 +7374,7 @@ Point.prototype.eq = function eq(other) {
 Point.prototype.toP = Point.prototype.normalize;
 Point.prototype.mixedAdd = Point.prototype.add;
 
-},{"../../elliptic":37,"../curve":40,"bn.js":31,"inherits":74}],40:[function(require,module,exports){
+},{"../../elliptic":17,"../curve":20,"bn.js":11,"inherits":79}],20:[function(require,module,exports){
 'use strict';
 
 var curve = exports;
@@ -10275,7 +7384,7 @@ curve.short = require('./short');
 curve.mont = require('./mont');
 curve.edwards = require('./edwards');
 
-},{"./base":38,"./edwards":39,"./mont":41,"./short":42}],41:[function(require,module,exports){
+},{"./base":18,"./edwards":19,"./mont":21,"./short":22}],21:[function(require,module,exports){
 'use strict';
 
 var curve = require('../curve');
@@ -10453,7 +7562,7 @@ Point.prototype.getX = function getX() {
   return this.x.fromRed();
 };
 
-},{"../../elliptic":37,"../curve":40,"bn.js":31,"inherits":74}],42:[function(require,module,exports){
+},{"../../elliptic":17,"../curve":20,"bn.js":11,"inherits":79}],22:[function(require,module,exports){
 'use strict';
 
 var curve = require('../curve');
@@ -11364,7 +8473,7 @@ JPoint.prototype.isInfinity = function isInfinity() {
   return this.z.cmpn(0) === 0;
 };
 
-},{"../../elliptic":37,"../curve":40,"bn.js":31,"inherits":74}],43:[function(require,module,exports){
+},{"../../elliptic":17,"../curve":20,"bn.js":11,"inherits":79}],23:[function(require,module,exports){
 'use strict';
 
 var curves = exports;
@@ -11571,7 +8680,7 @@ defineCurve('secp256k1', {
   ]
 });
 
-},{"../elliptic":37,"./precomputed/secp256k1":51,"hash.js":68}],44:[function(require,module,exports){
+},{"../elliptic":17,"./precomputed/secp256k1":31,"hash.js":73}],24:[function(require,module,exports){
 'use strict';
 
 var BN = require('bn.js');
@@ -11795,7 +8904,7 @@ EC.prototype.getKeyRecoveryParam = function(e, signature, Q, enc) {
   throw new Error('Unable to find valid recovery factor');
 };
 
-},{"../../elliptic":37,"./key":45,"./signature":46,"bn.js":31}],45:[function(require,module,exports){
+},{"../../elliptic":17,"./key":25,"./signature":26,"bn.js":11}],25:[function(require,module,exports){
 'use strict';
 
 var BN = require('bn.js');
@@ -11904,7 +9013,7 @@ KeyPair.prototype.inspect = function inspect() {
          ' pub: ' + (this.pub && this.pub.inspect()) + ' >';
 };
 
-},{"bn.js":31}],46:[function(require,module,exports){
+},{"bn.js":11}],26:[function(require,module,exports){
 'use strict';
 
 var BN = require('bn.js');
@@ -12041,7 +9150,7 @@ Signature.prototype.toDER = function toDER(enc) {
   return utils.encode(res, enc);
 };
 
-},{"../../elliptic":37,"bn.js":31}],47:[function(require,module,exports){
+},{"../../elliptic":17,"bn.js":11}],27:[function(require,module,exports){
 'use strict';
 
 var hash = require('hash.js');
@@ -12161,7 +9270,7 @@ EDDSA.prototype.isPoint = function isPoint(val) {
   return val instanceof this.pointClass;
 };
 
-},{"../../elliptic":37,"./key":48,"./signature":49,"hash.js":68}],48:[function(require,module,exports){
+},{"../../elliptic":17,"./key":28,"./signature":29,"hash.js":73}],28:[function(require,module,exports){
 'use strict';
 
 var elliptic = require('../../elliptic');
@@ -12259,7 +9368,7 @@ KeyPair.prototype.getPublic = function getPublic(enc) {
 
 module.exports = KeyPair;
 
-},{"../../elliptic":37}],49:[function(require,module,exports){
+},{"../../elliptic":17}],29:[function(require,module,exports){
 'use strict';
 
 var BN = require('bn.js');
@@ -12327,7 +9436,7 @@ Signature.prototype.toHex = function toHex() {
 
 module.exports = Signature;
 
-},{"../../elliptic":37,"bn.js":31}],50:[function(require,module,exports){
+},{"../../elliptic":17,"bn.js":11}],30:[function(require,module,exports){
 'use strict';
 
 var hash = require('hash.js');
@@ -12443,7 +9552,7 @@ HmacDRBG.prototype.generate = function generate(len, enc, add, addEnc) {
   return utils.encode(res, enc);
 };
 
-},{"../elliptic":37,"hash.js":68}],51:[function(require,module,exports){
+},{"../elliptic":17,"hash.js":73}],31:[function(require,module,exports){
 module.exports = {
   doubles: {
     step: 4,
@@ -13225,7 +10334,7 @@ module.exports = {
   }
 };
 
-},{}],52:[function(require,module,exports){
+},{}],32:[function(require,module,exports){
 'use strict';
 
 var utils = exports;
@@ -13400,16 +10509,12 @@ function intFromLE(bytes) {
 utils.intFromLE = intFromLE;
 
 
-},{"bn.js":31}],53:[function(require,module,exports){
+},{"bn.js":11}],33:[function(require,module,exports){
 module.exports={
   "_args": [
     [
       "elliptic@^6.2.3",
-      "/Users/alex/Projects/ethereumjs/ethereumjs-vm/node_modules/secp256k1"
-    ],
-    [
-      "elliptic@^6.2.3",
-      "/Users/alex/Projects/ethereumjs/ethereumjs-vm/node_modules/secp256k1"
+      "/Users/alex/Projects/ethereumjs/browser-builds/node_modules/secp256k1"
     ]
   ],
   "_from": "elliptic@>=6.2.3 <7.0.0",
@@ -13435,9 +10540,11 @@ module.exports={
   "_requiredBy": [
     "/secp256k1"
   ],
+  "_resolved": "https://registry.npmjs.org/elliptic/-/elliptic-6.2.3.tgz",
+  "_shasum": "18e46d7306b0951275a2d42063270a14b74ebe99",
   "_shrinkwrap": null,
   "_spec": "elliptic@^6.2.3",
-  "_where": "/Users/alex/Projects/ethereumjs/ethereumjs-vm/node_modules/secp256k1",
+  "_where": "/Users/alex/Projects/ethereumjs/browser-builds/node_modules/secp256k1",
   "author": {
     "email": "fedor@indutny.com",
     "name": "Fedor Indutny"
@@ -13502,7 +10609,7 @@ module.exports={
   "version": "6.2.3"
 }
 
-},{}],54:[function(require,module,exports){
+},{}],34:[function(require,module,exports){
 var prr = require('prr')
 
 function init (type, message, cause) {
@@ -13559,7 +10666,7 @@ module.exports = function (errno) {
   }
 }
 
-},{"prr":56}],55:[function(require,module,exports){
+},{"prr":36}],35:[function(require,module,exports){
 var all = module.exports.all = [
   {
     errno: -2,
@@ -13874,7 +10981,7 @@ all.forEach(function (error) {
 module.exports.custom = require('./custom')(module.exports)
 module.exports.create = module.exports.custom.createError
 
-},{"./custom":54}],56:[function(require,module,exports){
+},{"./custom":34}],36:[function(require,module,exports){
 /*!
   * prr
   * (c) 2013 Rod Vagg <rod@vagg.org>
@@ -13938,7 +11045,910 @@ module.exports.create = module.exports.custom.createError
 
   return prr
 })
-},{}],57:[function(require,module,exports){
+},{}],37:[function(require,module,exports){
+module.exports={
+  "genesisGasLimit": {
+    "v": 5000,
+    "d": "Gas limit of the Genesis block."
+  },
+  "genesisDifficulty": {
+    "v": 17179869184,
+    "d": "Difficulty of the Genesis block."
+  },
+  "genesisNonce": {
+    "v": "0x0000000000000042",
+    "d": "the geneis nonce"
+  },
+  "genesisExtraData": {
+    "v": "0x11bbe8db4e347b4e8c937c1c8370e4b5ed33adb3db69cbdb7a38e1e50b1b82fa",
+    "d": "extra data "
+  },
+  "genesisHash": {
+    "v": "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3",
+    "d": "genesis hash"
+  },
+  "genesisStateRoot": {
+    "v": "0xd7f8974fb5ac78d9ac099b9ad5018bedc2ce0a72dad1827a1709da30580f0544",
+    "d": "the genesis state root"
+  },
+  "minGasLimit": {
+    "v": 5000,
+    "d": "Minimum the gas limit may ever be."
+  },
+  "gasLimitBoundDivisor": {
+    "v": 1024,
+    "d": "The bound divisor of the gas limit, used in update calculations."
+  },
+  "minimumDifficulty": {
+    "v": 131072,
+    "d": "The minimum that the difficulty may ever be."
+  },
+  "difficultyBoundDivisor": {
+    "v": 2048,
+    "d": "The bound divisor of the difficulty, used in the update calculations."
+  },
+  "durationLimit": {
+    "v": 13,
+    "d": "The decision boundary on the blocktime duration used to determine whether difficulty should go up or not."
+  },
+  "maximumExtraDataSize": {
+    "v": 32,
+    "d": "Maximum size extra data may be after Genesis."
+  },
+  "epochDuration": {
+    "v": 30000,
+    "d": "Duration between proof-of-work epochs."
+  },
+  "stackLimit": {
+    "v": 1024,
+    "d": "Maximum size of VM stack allowed."
+  },
+  "callCreateDepth": {
+    "v": 1024,
+    "d": "Maximum depth of call/create stack."
+  },
+
+  "tierStepGas": {
+    "v": [0, 2, 3, 5, 8, 10, 20],
+    "d": "Once per operation, for a selection of them."
+  },
+  "expGas": {
+    "v": 10,
+    "d": "Once per EXP instuction."
+  },
+  "expByteGas": {
+    "v": 10,
+    "d": "Times ceil(log256(exponent)) for the EXP instruction."
+  },
+
+  "sha3Gas": {
+    "v": 30,
+    "d": "Once per SHA3 operation."
+  },
+  "sha3WordGas": {
+    "v": 6,
+    "d": "Once per word of the SHA3 operation's data."
+  },
+  "sloadGas": {
+    "v": 50,
+    "d": "Once per SLOAD operation."
+  },
+  "sstoreSetGas": {
+    "v": 20000,
+    "d": "Once per SSTORE operation if the zeroness changes from zero."
+  },
+  "sstoreResetGas": {
+    "v": 5000,
+    "d": "Once per SSTORE operation if the zeroness does not change from zero."
+  },
+  "sstoreRefundGas": {
+    "v": 15000,
+    "d": "Once per SSTORE operation if the zeroness changes to zero."
+  },
+  "jumpdestGas": {
+    "v": 1,
+    "d": "Refunded gas, once per SSTORE operation if the zeroness changes to zero."
+  },
+
+  "logGas": {
+    "v": 375,
+    "d": "Per LOG* operation."
+  },
+  "logDataGas": {
+    "v": 8,
+    "d": "Per byte in a LOG* operation's data."
+  },
+  "logTopicGas": {
+    "v": 375,
+    "d": "Multiplied by the * of the LOG*, per LOG transaction. e.g. LOG0 incurs 0 * c_txLogTopicGas, LOG4 incurs 4 * c_txLogTopicGas."
+  },
+
+  "createGas": {
+    "v": 32000,
+    "d": "Once per CREATE operation & contract-creation transaction."
+  },
+
+  "callGas": {
+    "v": 40,
+    "d": "Once per CALL operation & message call transaction."
+  },
+  "callStipend": {
+    "v": 2300,
+    "d": "Free gas given at beginning of call."
+  },
+  "callValueTransferGas": {
+    "v": 9000,
+    "d": "Paid for CALL when the value transfor is non-zero."
+  },
+  "callNewAccountGas": {
+    "v": 25000,
+    "d": "Paid for CALL when the destination address didn't exist prior."
+  },
+
+  "suicideRefundGas": {
+    "v": 24000,
+    "d": "Refunded following a suicide operation."
+  },
+
+  "memoryGas": {
+    "v": 3,
+    "d": "Times the address of the (highest referenced byte in memory + 1). NOTE: referencing happens on read, write and in instructions such as RETURN and CALL."
+  },
+  "quadCoeffDiv": {
+    "v": 512,
+    "d": "Divisor for the quadratic particle of the memory cost equation."
+  },
+
+  "createDataGas": {
+    "v": 200,
+    "d": ""
+  },
+  "txGas": {
+    "v": 21000,
+    "d": "Per transaction. NOTE: Not payable on data of calls between transactions."
+  },
+  "txCreation": {
+    "v": 32000,
+    "d": "the cost of creating a contract via tx"
+  },
+  "txDataZeroGas": {
+    "v": 4,
+    "d": "Per byte of data attached to a transaction that equals zero. NOTE: Not payable on data of calls between transactions."
+  },
+  "txDataNonZeroGas": {
+    "v": 68,
+    "d": "Per byte of data attached to a transaction that is not equal to zero. NOTE: Not payable on data of calls between transactions."
+  },
+
+  "copyGas": {
+    "v": 3,
+    "d": "Multiplied by the number of 32-byte words that are copied (round up) for any *COPY operation and added."
+  },
+
+  "ecrecoverGas": {
+    "v": 3000,
+    "d": ""
+  },
+  "sha256Gas": {
+    "v": 60,
+    "d": ""
+  },
+  "sha256WordGas": {
+    "v": 12,
+    "d": ""
+  },
+  "ripemd160Gas": {
+    "v": 600,
+    "d": ""
+  },
+  "ripemd160WordGas": {
+    "v": 120,
+    "d": ""
+  },
+  "identityGas": {
+    "v": 15,
+    "d": ""
+  },
+  "identityWordGas": {
+    "v": 3,
+    "d": ""
+  },
+  "minerReward": {
+    "v": "5000000000000000000",
+    "d": "the amount a miner get rewarded for mining a block"
+  },
+  "ommerReward": {
+    "v": "625000000000000000",
+    "d": "The amount of wei a miner of an uncle block gets for being inculded in the blockchain"
+  },
+  "niblingReward": {
+    "v": "156250000000000000",
+    "d": "the amount a miner gets for inculding a uncle"
+  },
+  "homeSteadForkNumber": {
+    "v": 1000000,
+    "d": "the block that the homestead fork started at"
+  },
+  "timebombPeriod": {
+    "v": 100000,
+    "d": "Exponential difficulty timebomb period"
+  },
+  "freeBlockPeriod": {
+    "v": 2
+  }
+}
+
+},{}],38:[function(require,module,exports){
+module.exports = require('./params.json')
+
+},{"./params.json":37}],39:[function(require,module,exports){
+(function (Buffer){
+const ethUtil = require('ethereumjs-util')
+const rlp = require('rlp')
+
+var Account = module.exports = function (data) {
+  // Define Properties
+  var fields = [{
+    name: 'nonce',
+    default: new Buffer([])
+  }, {
+    name: 'balance',
+    default: new Buffer([])
+  }, {
+    name: 'stateRoot',
+    length: 32,
+    default: ethUtil.SHA3_RLP
+  }, {
+    name: 'codeHash',
+    length: 32,
+    default: ethUtil.SHA3_NULL
+  }]
+
+  ethUtil.defineProperties(this, fields, data)
+}
+
+Account.prototype.serialize = function () {
+  return rlp.encode(this.raw)
+}
+
+Account.prototype.isContract = function () {
+  return this.codeHash.toString('hex') !== ethUtil.SHA3_NULL_S
+}
+
+Account.prototype.getCode = function (state, cb) {
+  if (!this.isContract()) {
+    cb(null, new Buffer([]))
+    return
+  }
+
+  state.getRaw(this.codeHash, function (err, val) {
+    var compiled = val[0] === 1
+    val = val.slice(1)
+    cb(err, val, compiled)
+  })
+}
+
+Account.prototype.setCode = function (trie, code, compiled, cb) {
+  var self = this
+
+  if (arguments.length === 3) {
+    cb = compiled
+    compiled = false
+  }
+
+  // store code for a new contract
+  if (!compiled) {
+    this.codeHash = ethUtil.sha3(code)
+  }
+
+  // set the compile flag
+  code = Buffer.concat([new Buffer([compiled]), code])
+
+  if (this.codeHash.toString('hex') === ethUtil.SHA3_NULL_S) {
+    cb(null, new Buffer([]))
+    return
+  }
+
+  trie.putRaw(this.codeHash, code, function (err) {
+    cb(err, self.codeHash)
+  })
+}
+
+Account.prototype.getStorage = function (trie, key, cb) {
+  var t = trie.copy()
+  t.root = this.stateRoot
+  t.get(key, cb)
+}
+
+Account.prototype.setStorage = function (trie, key, val, cb) {
+  var self = this
+  var t = trie.copy()
+  t.root = self.stateRoot
+  t.put(key, val, function (err) {
+    if (err) return cb()
+    self.stateRoot = t.root
+    cb()
+  })
+}
+
+Account.prototype.isEmpty = function () {
+  return this.balance.toString('hex') === '' &&
+  this.nonce.toString('hex') === '' &&
+  this.stateRoot.toString('hex') === ethUtil.SHA3_RLP_S &&
+  this.codeHash.toString('hex') === ethUtil.SHA3_NULL_S
+}
+
+}).call(this,require("buffer").Buffer)
+},{"buffer":185,"ethereumjs-util":47,"rlp":129}],40:[function(require,module,exports){
+(function (Buffer){
+const utils = require('ethereumjs-util')
+const params = require('ethereum-common')
+const BN = utils.BN
+  /**
+   * An object that repersents the block header
+   * @constructor
+   * @param {Array} data raw data, deserialized
+   * @prop {Buffer} parentHash the blocks' parent's hash
+   * @prop {Buffer} uncleHash sha3(rlp_encode(uncle_list))
+   * @prop {Buffer} coinbase the miner address
+   * @prop {Buffer} stateRoot The root of a Merkle Patricia tree
+   * @prop {Buffer} transactionTrie the root of a Trie containing the transactions
+   * @prop {Buffer} receiptTrie the root of a Trie containing the transaction Reciept
+   * @prop {Buffer} bloom
+   * @prop {Buffer} difficulty
+   * @prop {Buffer} number the block's height
+   * @prop {Buffer} gasLimit
+   * @prop {Buffer} gasUsed
+   * @prop {Buffer} timestamp
+   * @prop {Buffer} extraData
+   * @prop {Array.<Buffer>} raw an array of buffers containing the raw blocks.
+   */
+var BlockHeader = module.exports = function (data) {
+  var fields = [{
+    name: 'parentHash',
+    length: 32,
+    default: utils.zeros(32)
+  }, {
+    name: 'uncleHash',
+    default: utils.SHA3_RLP_ARRAY
+  }, {
+    name: 'coinbase',
+    length: 20,
+    default: utils.zeros(20)
+  }, {
+    name: 'stateRoot',
+    length: 32,
+    default: utils.zeros(32)
+  }, {
+    name: 'transactionsTrie',
+    length: 32,
+    default: utils.SHA3_RLP
+  }, {
+    name: 'receiptTrie',
+    length: 32,
+    default: utils.SHA3_RLP
+  }, {
+    name: 'bloom',
+    default: utils.zeros(256)
+  }, {
+    name: 'difficulty',
+    default: new Buffer([])
+  }, {
+    name: 'number',
+    default: utils.intToBuffer(params.homeSteadForkNumber.v)
+  }, {
+    name: 'gasLimit',
+    default: new Buffer('ffffffffffffff', 'hex')
+  }, {
+    name: 'gasUsed',
+    empty: true,
+    default: new Buffer([])
+  }, {
+    name: 'timestamp',
+    default: new Buffer([])
+  }, {
+    name: 'extraData',
+    allowZero: true,
+    empty: true,
+    default: new Buffer([])
+  }, {
+    name: 'mixHash',
+    default: utils.zeros(32)
+      // length: 32
+  }, {
+    name: 'nonce',
+    default: new Buffer([]) // sha3(42)
+  }]
+  utils.defineProperties(this, fields, data)
+}
+
+/**
+ * Returns the canoncical difficulty of the block
+ * @method canonicalDifficulty
+ * @param {Block} parentBlock the parent `Block` of the this header
+ * @return {BN}
+ */
+BlockHeader.prototype.canonicalDifficulty = function (parentBlock) {
+  const blockTs = new BN(this.timestamp)
+  const parentTs = new BN(parentBlock.header.timestamp)
+  const parentDif = new BN(parentBlock.header.difficulty)
+  const minimumDifficulty = new BN(params.minimumDifficulty.v)
+  var offset = parentDif.div(new BN(params.difficultyBoundDivisor.v))
+  var dif
+
+  if (this.isHomestead()) {
+    // homestead
+    // 1 - (block_timestamp - parent_timestamp) // 10
+    var a = blockTs.sub(parentTs).divn(10).neg().addn(1)
+    var cutoff = new BN(-99)
+    // MAX(cutoff, a)
+    if (cutoff.cmp(a) === 1) {
+      a = cutoff
+    }
+    dif = parentDif.add(offset.mul(a))
+  } else {
+    // prehomestead
+    if (parentTs.addn(params.durationLimit.v).cmp(blockTs) === 1) {
+      dif = offset.add(parentDif)
+    } else {
+      dif = parentDif.sub(offset)
+    }
+  }
+
+  var exp = new BN(this.number).divn(100000).subn(2)
+  if (!exp.isNeg()) {
+    dif.iadd(new BN(2).pow(exp))
+  }
+
+  if (dif.cmp(minimumDifficulty) === -1) {
+    dif = minimumDifficulty
+  }
+
+  return dif
+}
+
+/**
+ * checks that the block's `difficuly` matches the canonical difficulty
+ * @method validateDifficulty
+ * @param {Block} parentBlock this block's parent
+ * @return {Boolean}
+ */
+BlockHeader.prototype.validateDifficulty = function (parentBlock) {
+  const dif = this.canonicalDifficulty(parentBlock)
+  return dif.cmp(new BN(this.difficulty)) === 0
+}
+
+/**
+ * Validates the gasLimit
+ * @method validateGasLimit
+ * @param {Block} parentBlock this block's parent
+ * @returns {Boolean}
+ */
+BlockHeader.prototype.validateGasLimit = function (parentBlock) {
+  const pGasLimit = utils.bufferToInt(parentBlock.header.gasLimit)
+  const gasLimit = utils.bufferToInt(this.gasLimit)
+  const a = Math.floor(pGasLimit / params.gasLimitBoundDivisor.v)
+  const maxGasLimit = pGasLimit + a
+  const minGasLimit = pGasLimit - a
+
+  return maxGasLimit > gasLimit && minGasLimit < gasLimit && params.minGasLimit.v < gasLimit
+}
+
+/**
+ * Validates the entire block header
+ * @method validate
+ * @param {Blockchain} blockChain the blockchain that this block is validating against
+ * @param {Bignum} [height] if this is an uncle header, this is the height of the block that is including it
+ * @param {Function} cb the callback function. The callback is given an `error` if the block is invalid
+ */
+BlockHeader.prototype.validate = function (blockchain, height, cb) {
+  var self = this
+  if (arguments.length === 2) {
+    cb = height
+    height = false
+  }
+
+  if (this.isGenesis()) {
+    return cb()
+  }
+
+  // find the blocks parent
+  blockchain.getBlock(self.parentHash, function (err, parentBlock) {
+    if (err) {
+      return cb('could not find parent block')
+    }
+
+    self.parentBlock = parentBlock
+
+    var number = new BN(self.number)
+    if (number.cmp(new BN(parentBlock.header.number).addn(1)) !== 0) {
+      return cb('invalid number')
+    }
+
+    if (height) {
+      var dif = height.sub(new BN(parentBlock.header.number))
+      if (!(dif.cmpn(8) === -1 && dif.cmpn(1) === 1)) {
+        return cb('uncle block has a parent that is too old or to young')
+      }
+    }
+
+    if (!self.validateDifficulty(parentBlock)) {
+      return cb('invalid Difficulty')
+    }
+
+    if (!self.validateGasLimit(parentBlock)) {
+      return cb('invalid gas limit')
+    }
+
+    if (utils.bufferToInt(parentBlock.header.number) + 1 !== utils.bufferToInt(self.number)) {
+      return cb('invalid heigth')
+    }
+
+    if (utils.bufferToInt(self.timestamp) <= utils.bufferToInt(parentBlock.header.timestamp)) {
+      return cb('invalid timestamp')
+    }
+
+    if (self.extraData.length > params.maximumExtraDataSize.v) {
+      return cb('invalid amount of extra data')
+    }
+
+    cb()
+  })
+}
+
+/**
+ * Returns the sha3 hash of the blockheader
+ * @method hash
+ * @return {Buffer}
+ */
+BlockHeader.prototype.hash = function () {
+  return utils.rlphash(this.raw)
+}
+
+/**
+ * checks if the blockheader is a genesis header
+ * @method isGenesis
+ * @return {Boolean}
+ */
+BlockHeader.prototype.isGenesis = function () {
+  return this.number.toString('hex') === ''
+}
+
+/**
+ * Determines if a given block part of homestead or not
+ * @method isHomestead
+ * @return Boolean
+ */
+BlockHeader.prototype.isHomestead = function () {
+  return utils.bufferToInt(this.number) >= params.homeSteadForkNumber.v
+}
+
+}).call(this,require("buffer").Buffer)
+},{"buffer":185,"ethereum-common":44,"ethereumjs-util":47}],41:[function(require,module,exports){
+(function (Buffer){
+const ethUtil = require('ethereumjs-util')
+const Tx = require('ethereumjs-tx')
+const Trie = require('merkle-patricia-tree')
+const BN = ethUtil.BN
+const rlp = ethUtil.rlp
+const async = require('async')
+const BlockHeader = require('./header')
+const params = require('ethereum-common')
+
+/**
+ * Creates a new block object
+ * @constructor the raw serialized or the deserialized block.
+ * @param {Array|Buffer|Object} data
+ * @prop {Header} header the block's header
+ * @prop {Array.<Header>} uncleList an array of uncle headers
+ * @prop {Array.<Buffer>} raw an array of buffers containing the raw blocks.
+ */
+var Block = module.exports = function (data) {
+  this.transactions = []
+  this.uncleHeaders = []
+  this._inBlockChain = false
+  this.txTrie = new Trie()
+
+  Object.defineProperty(this, 'raw', {
+    get: function () {
+      return this.serialize(false)
+    }
+  })
+
+  var rawTransactions, rawUncleHeaders
+
+  // defaults
+  if (!data) {
+    data = [[], [], []]
+  }
+
+  if (Buffer.isBuffer(data)) {
+    data = rlp.decode(data)
+  }
+
+  if (Array.isArray(data)) {
+    this.header = new BlockHeader(data[0])
+    rawTransactions = data[1]
+    rawUncleHeaders = data[2]
+  } else {
+    this.header = new BlockHeader(data.header)
+    rawTransactions = data.transactions
+    rawUncleHeaders = data.uncleHeaders
+  }
+
+  // parse uncle headers
+  for (var i = 0; i < rawUncleHeaders.length; i++) {
+    this.uncleHeaders.push(new BlockHeader(rawUncleHeaders[i]))
+  }
+
+  var homestead = this.isHomestead()
+  // parse transactions
+  for (i = 0; i < rawTransactions.length; i++) {
+    var tx = new Tx(rawTransactions[i])
+    tx._homestead = homestead
+    this.transactions.push(tx)
+  }
+}
+
+/**
+ * Produces a hash the RLP of the block
+ * @method hash
+ */
+Block.prototype.hash = function () {
+  return this.header.hash()
+}
+
+/**
+ * Determines if a given block is the genesis block
+ * @method isGenisis
+ * @return Boolean
+ */
+Block.prototype.isGenesis = function () {
+  return this.header.isGenesis()
+}
+
+/**
+ * Determines if a given block part of homestead or not
+ * @method isHomestead
+ * @return Boolean
+ */
+Block.prototype.isHomestead = function () {
+  return this.header.isHomestead()
+}
+
+/**
+ * turns the block in to the canonical genesis block
+ * @method setGenesisParams
+ */
+Block.prototype.setGenesisParams = function () {
+  this.header.gasLimit = params.genesisGasLimit.v
+  this.header.difficulty = params.genesisDifficulty.v
+  this.header.extraData = params.genesisExtraData.v
+  this.header.nonce = params.genesisNonce.v
+  this.header.stateRoot = params.genesisStateRoot.v
+  this.header.number = new Buffer([])
+}
+
+/**
+ * Produces a serialization of the block.
+ * @method serialize
+ * @param {Boolean} rlpEncode whether to rlp encode the block or not
+ */
+Block.prototype.serialize = function (rlpEncode) {
+  var raw = [this.header.raw, [],
+    []
+  ]
+
+  // rlpEnode defaults to true
+  if (typeof rlpEncode === 'undefined') {
+    rlpEncode = true
+  }
+
+  this.transactions.forEach(function (tx) {
+    raw[1].push(tx.raw)
+  })
+
+  this.uncleHeaders.forEach(function (uncle) {
+    raw[2].push(uncle.raw)
+  })
+
+  return rlpEncode ? rlp.encode(raw) : raw
+}
+
+/**
+ * Generate transaction trie. The tx trie must be generated before the transaction trie can
+ * be validated with `validateTransactionTrie`
+ * @method genTxTrie
+ * @param {Function} cb the callback
+ */
+Block.prototype.genTxTrie = function (cb) {
+  var i = 0
+  var self = this
+
+  async.eachSeries(this.transactions, function (tx, done) {
+    self.txTrie.put(rlp.encode(i), tx.serialize(), done)
+    i++
+  }, cb)
+}
+
+/**
+ * Validates the transaction trie
+ * @method validateTransactionTrie
+ * @return {Boolean}
+ */
+Block.prototype.validateTransactionsTrie = function () {
+  var txT = this.header.transactionsTrie.toString('hex')
+  if (this.transactions.length) {
+    return txT === this.txTrie.root.toString('hex')
+  } else {
+    return txT === ethUtil.SHA3_RLP.toString('hex')
+  }
+}
+
+/**
+ * Validates the transactions
+ * @method validateTransactions
+ * @param {Boolean} [stringError=false] whether to return a string with a dscription of why the validation failed or return a Bloolean
+ * @return {Boolean}
+ */
+Block.prototype.validateTransactions = function (stringError) {
+  var errors = []
+
+  this.transactions.forEach(function (tx, i) {
+    var error = tx.validate(true)
+    if (error) {
+      error += ' at tx ' + i
+    }
+    errors.push(error)
+  })
+
+  if (stringError === undefined || stringError === false) {
+    return errors.length === 0
+  } else {
+    return arrayToString(errors)
+  }
+}
+
+/**
+ * Validates the entire block. Returns a string to the callback if block is invalid
+ * @method validate
+ * @param {BlockChain} blockChain the blockchain that this block wants to be part of
+ * @param {Function} cb the callback which is given a `String` if the block is not valid
+ */
+Block.prototype.validate = function (blockChain, cb) {
+  var self = this
+  var errors = []
+
+  async.parallel([
+    // validate uncles
+    self.validateUncles.bind(self, blockChain),
+    // validate block
+    self.header.validate.bind(self.header, blockChain),
+    // generate the transaction trie
+    self.genTxTrie.bind(self)
+  ], function (err) {
+    if (err) {
+      errors.push(err)
+    }
+
+    if (!self.validateTransactionsTrie()) {
+      errors.push('invalid transaction true')
+    }
+
+    var txErrors = self.validateTransactions(true)
+    if (txErrors !== '') {
+      errors.push(txErrors)
+    }
+
+    if (!self.validateUnclesHash()) {
+      errors.push('invild uncle hash')
+    }
+
+    cb(arrayToString(errors))
+  })
+}
+
+/**
+ * Validates the uncle's hash
+ * @method validateUncleHash
+ * @return {Boolean}
+ */
+Block.prototype.validateUnclesHash = function () {
+  var raw = []
+  this.uncleHeaders.forEach(function (uncle) {
+    raw.push(uncle.raw)
+  })
+
+  raw = rlp.encode(raw)
+  return ethUtil.sha3(raw).toString('hex') === this.header.uncleHash.toString('hex')
+}
+
+/**
+ * Validates the uncles that are in the block if any. Returns a string to the callback if uncles are invalid
+ * @method validateUncles
+ * @param {Blockchain} blockChaina an instance of the Blockchain
+ * @param {Function} cb the callback
+ */
+Block.prototype.validateUncles = function (blockChain, cb) {
+  if (this.isGenesis()) {
+    return cb()
+  }
+
+  var self = this
+
+  if (self.uncleHeaders.length > 2) {
+    return cb('too many uncle headers')
+  }
+
+  var uncleHashes = self.uncleHeaders.map(function (header) {
+    return header.hash().toString('hex')
+  })
+
+  if (!((new Set(uncleHashes)).size === uncleHashes.length)) {
+    return cb('dublicate unlces')
+  }
+
+  async.each(self.uncleHeaders, function (uncle, cb2) {
+    var height = new BN(self.header.number)
+    async.parallel([
+      uncle.validate.bind(uncle, blockChain, height),
+      // check to make sure the uncle is not already in the blockchain
+      function (cb3) {
+        blockChain.getDetails(uncle.hash(), function (err, blockInfo) {
+          // TODO: remove uncles from BC
+          if (blockInfo && blockInfo.isUncle) {
+            cb3(err || 'uncle already included')
+          } else {
+            cb3()
+          }
+        })
+      }
+    ], cb2)
+  }, cb)
+}
+
+/**
+ * Converts the block toJSON
+ * @method toJSON
+ * @param {Bool} labeled whether to create an labeled object or an array
+ * @return {Object}
+ */
+Block.prototype.toJSON = function (labeled) {
+  if (labeled) {
+    var obj = {
+      header: this.header.toJSON(true),
+      transactions: [],
+      uncleHeaders: []
+    }
+
+    this.transactions.forEach(function (tx) {
+      obj.transactions.push(tx.toJSON(labeled))
+    })
+
+    this.uncleHeaders.forEach(function (uh) {
+      obj.uncleHeaders.push(uh.toJSON())
+    })
+    return obj
+  } else {
+    return ethUtil.baToJSON(this.raw)
+  }
+}
+
+function arrayToString (array) {
+  try {
+    return array.reduce(function (str, err) {
+      if (str) {
+        str += ' '
+      }
+      return str + err
+    })
+  } catch (e) {
+    return ''
+  }
+}
+
+}).call(this,require("buffer").Buffer)
+},{"./header":40,"async":10,"buffer":185,"ethereum-common":44,"ethereumjs-tx":46,"ethereumjs-util":47,"merkle-patricia-tree":110}],42:[function(require,module,exports){
 module.exports=[
   {
     "ip": "52.16.188.185",
@@ -13962,7 +11972,7 @@ module.exports=[
   }
 ]
 
-},{}],58:[function(require,module,exports){
+},{}],43:[function(require,module,exports){
 module.exports={
   "3282791d6fd713f1e94f4bfd565eaa78b3a0599d": "1337000000000000000000",
   "17961d633bcf20a7b029a7d94b7df4da2ec5427f": "229427000000000000000",
@@ -22859,916 +20869,18 @@ module.exports={
   "756f45e3fa69347a9a973a725e3c98bc4db0b5a0": "200000000000000000000"
 }
 
-},{}],59:[function(require,module,exports){
+},{}],44:[function(require,module,exports){
 var params = require('./params.json')
 params.genesisState = require('./genesisState.json')
 params.bootstrapNodes = require('./bootstrapNodes.json')
 module.exports = params
 
-},{"./bootstrapNodes.json":57,"./genesisState.json":58,"./params.json":60}],60:[function(require,module,exports){
-module.exports={
-  "genesisGasLimit": {
-    "v": 5000,
-    "d": "Gas limit of the Genesis block."
-  },
-  "genesisDifficulty": {
-    "v": 17179869184,
-    "d": "Difficulty of the Genesis block."
-  },
-  "genesisNonce": {
-    "v": "0x0000000000000042",
-    "d": "the geneis nonce"
-  },
-  "genesisExtraData": {
-    "v": "0x11bbe8db4e347b4e8c937c1c8370e4b5ed33adb3db69cbdb7a38e1e50b1b82fa",
-    "d": "extra data "
-  },
-  "genesisHash": {
-    "v": "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3",
-    "d": "genesis hash"
-  },
-  "genesisStateRoot": {
-    "v": "0xd7f8974fb5ac78d9ac099b9ad5018bedc2ce0a72dad1827a1709da30580f0544",
-    "d": "the genesis state root"
-  },
-  "minGasLimit": {
-    "v": 5000,
-    "d": "Minimum the gas limit may ever be."
-  },
-  "gasLimitBoundDivisor": {
-    "v": 1024,
-    "d": "The bound divisor of the gas limit, used in update calculations."
-  },
-  "minimumDifficulty": {
-    "v": 131072,
-    "d": "The minimum that the difficulty may ever be."
-  },
-  "difficultyBoundDivisor": {
-    "v": 2048,
-    "d": "The bound divisor of the difficulty, used in the update calculations."
-  },
-  "durationLimit": {
-    "v": 13,
-    "d": "The decision boundary on the blocktime duration used to determine whether difficulty should go up or not."
-  },
-  "maximumExtraDataSize": {
-    "v": 32,
-    "d": "Maximum size extra data may be after Genesis."
-  },
-  "epochDuration": {
-    "v": 30000,
-    "d": "Duration between proof-of-work epochs."
-  },
-  "stackLimit": {
-    "v": 1024,
-    "d": "Maximum size of VM stack allowed."
-  },
-  "callCreateDepth": {
-    "v": 1024,
-    "d": "Maximum depth of call/create stack."
-  },
-
-  "tierStepGas": {
-    "v": [0, 2, 3, 5, 8, 10, 20],
-    "d": "Once per operation, for a selection of them."
-  },
-  "expGas": {
-    "v": 10,
-    "d": "Once per EXP instuction."
-  },
-  "expByteGas": {
-    "v": 10,
-    "d": "Times ceil(log256(exponent)) for the EXP instruction."
-  },
-
-  "sha3Gas": {
-    "v": 30,
-    "d": "Once per SHA3 operation."
-  },
-  "sha3WordGas": {
-    "v": 6,
-    "d": "Once per word of the SHA3 operation's data."
-  },
-  "sloadGas": {
-    "v": 50,
-    "d": "Once per SLOAD operation."
-  },
-  "sstoreSetGas": {
-    "v": 20000,
-    "d": "Once per SSTORE operation if the zeroness changes from zero."
-  },
-  "sstoreResetGas": {
-    "v": 5000,
-    "d": "Once per SSTORE operation if the zeroness does not change from zero."
-  },
-  "sstoreRefundGas": {
-    "v": 15000,
-    "d": "Once per SSTORE operation if the zeroness changes to zero."
-  },
-  "jumpdestGas": {
-    "v": 1,
-    "d": "Refunded gas, once per SSTORE operation if the zeroness changes to zero."
-  },
-
-  "logGas": {
-    "v": 375,
-    "d": "Per LOG* operation."
-  },
-  "logDataGas": {
-    "v": 8,
-    "d": "Per byte in a LOG* operation's data."
-  },
-  "logTopicGas": {
-    "v": 375,
-    "d": "Multiplied by the * of the LOG*, per LOG transaction. e.g. LOG0 incurs 0 * c_txLogTopicGas, LOG4 incurs 4 * c_txLogTopicGas."
-  },
-
-  "createGas": {
-    "v": 32000,
-    "d": "Once per CREATE operation & contract-creation transaction."
-  },
-
-  "callGas": {
-    "v": 40,
-    "d": "Once per CALL operation & message call transaction."
-  },
-  "callStipend": {
-    "v": 2300,
-    "d": "Free gas given at beginning of call."
-  },
-  "callValueTransferGas": {
-    "v": 9000,
-    "d": "Paid for CALL when the value transfor is non-zero."
-  },
-  "callNewAccountGas": {
-    "v": 25000,
-    "d": "Paid for CALL when the destination address didn't exist prior."
-  },
-
-  "suicideRefundGas": {
-    "v": 24000,
-    "d": "Refunded following a suicide operation."
-  },
-
-  "memoryGas": {
-    "v": 3,
-    "d": "Times the address of the (highest referenced byte in memory + 1). NOTE: referencing happens on read, write and in instructions such as RETURN and CALL."
-  },
-  "quadCoeffDiv": {
-    "v": 512,
-    "d": "Divisor for the quadratic particle of the memory cost equation."
-  },
-
-  "createDataGas": {
-    "v": 200,
-    "d": ""
-  },
-  "txGas": {
-    "v": 21000,
-    "d": "Per transaction. NOTE: Not payable on data of calls between transactions."
-  },
-  "txCreation": {
-    "v": 32000,
-    "d": "the cost of creating a contract via tx"
-  },
-  "txDataZeroGas": {
-    "v": 4,
-    "d": "Per byte of data attached to a transaction that equals zero. NOTE: Not payable on data of calls between transactions."
-  },
-  "txDataNonZeroGas": {
-    "v": 68,
-    "d": "Per byte of data attached to a transaction that is not equal to zero. NOTE: Not payable on data of calls between transactions."
-  },
-
-  "copyGas": {
-    "v": 3,
-    "d": "Multiplied by the number of 32-byte words that are copied (round up) for any *COPY operation and added."
-  },
-
-  "ecrecoverGas": {
-    "v": 3000,
-    "d": ""
-  },
-  "sha256Gas": {
-    "v": 60,
-    "d": ""
-  },
-  "sha256WordGas": {
-    "v": 12,
-    "d": ""
-  },
-  "ripemd160Gas": {
-    "v": 600,
-    "d": ""
-  },
-  "ripemd160WordGas": {
-    "v": 120,
-    "d": ""
-  },
-  "identityGas": {
-    "v": 15,
-    "d": ""
-  },
-  "identityWordGas": {
-    "v": 3,
-    "d": ""
-  },
-  "minerReward": {
-    "v": "5000000000000000000",
-    "d": "the amount a miner get rewarded for mining a block"
-  },
-  "ommerReward": {
-    "v": "625000000000000000",
-    "d": "The amount of wei a miner of an uncle block gets for being inculded in the blockchain"
-  },
-  "niblingReward": {
-    "v": "156250000000000000",
-    "d": "the amount a miner gets for inculding a uncle"
-  },
-  "homeSteadForkNumber": {
-    "v": 1000000,
-    "d": "the block that the homestead fork started at"
-  },
-  "timebombPeriod": {
-    "v": 100000,
-    "d": "Exponential difficulty timebomb period"
-  },
-  "freeBlockPeriod": {
-    "v": 2
-  }
-}
-
-},{}],61:[function(require,module,exports){
-(function (Buffer){
-const ethUtil = require('ethereumjs-util')
-const rlp = require('rlp')
-
-var Account = module.exports = function (data) {
-  // Define Properties
-  var fields = [{
-    name: 'nonce',
-    default: new Buffer([])
-  }, {
-    name: 'balance',
-    default: new Buffer([])
-  }, {
-    name: 'stateRoot',
-    length: 32,
-    default: ethUtil.SHA3_RLP
-  }, {
-    name: 'codeHash',
-    length: 32,
-    default: ethUtil.SHA3_NULL
-  }]
-
-  ethUtil.defineProperties(this, fields, data)
-}
-
-Account.prototype.serialize = function () {
-  return rlp.encode(this.raw)
-}
-
-Account.prototype.isContract = function () {
-  return this.codeHash.toString('hex') !== ethUtil.SHA3_NULL_S
-}
-
-Account.prototype.getCode = function (state, cb) {
-  if (!this.isContract()) {
-    cb(null, new Buffer([]))
-    return
-  }
-
-  state.getRaw(this.codeHash, function (err, val) {
-    var compiled = val[0] === 1
-    val = val.slice(1)
-    cb(err, val, compiled)
-  })
-}
-
-Account.prototype.setCode = function (trie, code, compiled, cb) {
-  var self = this
-
-  if (arguments.length === 3) {
-    cb = compiled
-    compiled = false
-  }
-
-  // store code for a new contract
-  if (!compiled) {
-    this.codeHash = ethUtil.sha3(code)
-  }
-
-  // set the compile flag
-  code = Buffer.concat([new Buffer([compiled]), code])
-
-  if (this.codeHash.toString('hex') === ethUtil.SHA3_NULL_S) {
-    cb(null, new Buffer([]))
-    return
-  }
-
-  trie.putRaw(this.codeHash, code, function (err) {
-    cb(err, self.codeHash)
-  })
-}
-
-Account.prototype.getStorage = function (trie, key, cb) {
-  var t = trie.copy()
-  t.root = this.stateRoot
-  t.get(key, cb)
-}
-
-Account.prototype.setStorage = function (trie, key, val, cb) {
-  var self = this
-  var t = trie.copy()
-  t.root = self.stateRoot
-  t.put(key, val, function (err) {
-    if (err) return cb()
-    self.stateRoot = t.root
-    cb()
-  })
-}
-
-Account.prototype.isEmpty = function () {
-  return this.balance.toString('hex') === '' &&
-  this.nonce.toString('hex') === '' &&
-  this.stateRoot.toString('hex') === ethUtil.SHA3_RLP_S &&
-  this.codeHash.toString('hex') === ethUtil.SHA3_NULL_S
-}
-
-}).call(this,require("buffer").Buffer)
-},{"buffer":179,"ethereumjs-util":66,"rlp":124}],62:[function(require,module,exports){
-(function (Buffer){
-const utils = require('ethereumjs-util')
-const params = require('ethereum-common')
-const BN = utils.BN
-  /**
-   * An object that repersents the block header
-   * @constructor
-   * @param {Array} data raw data, deserialized
-   * @prop {Buffer} parentHash the blocks' parent's hash
-   * @prop {Buffer} uncleHash sha3(rlp_encode(uncle_list))
-   * @prop {Buffer} coinbase the miner address
-   * @prop {Buffer} stateRoot The root of a Merkle Patricia tree
-   * @prop {Buffer} transactionTrie the root of a Trie containing the transactions
-   * @prop {Buffer} receiptTrie the root of a Trie containing the transaction Reciept
-   * @prop {Buffer} bloom
-   * @prop {Buffer} difficulty
-   * @prop {Buffer} number the block's height
-   * @prop {Buffer} gasLimit
-   * @prop {Buffer} gasUsed
-   * @prop {Buffer} timestamp
-   * @prop {Buffer} extraData
-   * @prop {Array.<Buffer>} raw an array of buffers containing the raw blocks.
-   */
-var BlockHeader = module.exports = function (data) {
-  var fields = [{
-    name: 'parentHash',
-    length: 32,
-    default: utils.zeros(32)
-  }, {
-    name: 'uncleHash',
-    default: utils.SHA3_RLP_ARRAY
-  }, {
-    name: 'coinbase',
-    length: 20,
-    default: utils.zeros(20)
-  }, {
-    name: 'stateRoot',
-    length: 32,
-    default: utils.zeros(32)
-  }, {
-    name: 'transactionsTrie',
-    length: 32,
-    default: utils.SHA3_RLP
-  }, {
-    name: 'receiptTrie',
-    length: 32,
-    default: utils.SHA3_RLP
-  }, {
-    name: 'bloom',
-    default: utils.zeros(256)
-  }, {
-    name: 'difficulty',
-    default: new Buffer([])
-  }, {
-    name: 'number',
-    default: utils.intToBuffer(params.homeSteadForkNumber.v)
-  }, {
-    name: 'gasLimit',
-    default: new Buffer('ffffffffffffff', 'hex')
-  }, {
-    name: 'gasUsed',
-    empty: true,
-    default: new Buffer([])
-  }, {
-    name: 'timestamp',
-    default: new Buffer([])
-  }, {
-    name: 'extraData',
-    allowZero: true,
-    empty: true,
-    default: new Buffer([])
-  }, {
-    name: 'mixHash',
-    default: utils.zeros(32)
-      // length: 32
-  }, {
-    name: 'nonce',
-    default: new Buffer([]) // sha3(42)
-  }]
-  utils.defineProperties(this, fields, data)
-}
-
-/**
- * Returns the canoncical difficulty of the block
- * @method canonicalDifficulty
- * @param {Block} parentBlock the parent `Block` of the this header
- * @return {BN}
- */
-BlockHeader.prototype.canonicalDifficulty = function (parentBlock) {
-  const blockTs = new BN(this.timestamp)
-  const parentTs = new BN(parentBlock.header.timestamp)
-  const parentDif = new BN(parentBlock.header.difficulty)
-  const minimumDifficulty = new BN(params.minimumDifficulty.v)
-  var offset = parentDif.div(new BN(params.difficultyBoundDivisor.v))
-  var dif
-
-  if (this.isHomestead()) {
-    // homestead
-    // 1 - (block_timestamp - parent_timestamp) // 10
-    var a = blockTs.sub(parentTs).divn(10).neg().addn(1)
-    var cutoff = new BN(-99)
-    // MAX(cutoff, a)
-    if (cutoff.cmp(a) === 1) {
-      a = cutoff
-    }
-    dif = parentDif.add(offset.mul(a))
-  } else {
-    // prehomestead
-    if (parentTs.addn(params.durationLimit.v).cmp(blockTs) === 1) {
-      dif = offset.add(parentDif)
-    } else {
-      dif = parentDif.sub(offset)
-    }
-  }
-
-  var exp = new BN(this.number).divn(100000).subn(2)
-  if (!exp.isNeg()) {
-    dif.iadd(new BN(2).pow(exp))
-  }
-
-  if (dif.cmp(minimumDifficulty) === -1) {
-    dif = minimumDifficulty
-  }
-
-  return dif
-}
-
-/**
- * checks that the block's `difficuly` matches the canonical difficulty
- * @method validateDifficulty
- * @param {Block} parentBlock this block's parent
- * @return {Boolean}
- */
-BlockHeader.prototype.validateDifficulty = function (parentBlock) {
-  const dif = this.canonicalDifficulty(parentBlock)
-  return dif.cmp(new BN(this.difficulty)) === 0
-}
-
-/**
- * Validates the gasLimit
- * @method validateGasLimit
- * @param {Block} parentBlock this block's parent
- * @returns {Boolean}
- */
-BlockHeader.prototype.validateGasLimit = function (parentBlock) {
-  const pGasLimit = utils.bufferToInt(parentBlock.header.gasLimit)
-  const gasLimit = utils.bufferToInt(this.gasLimit)
-  const a = Math.floor(pGasLimit / params.gasLimitBoundDivisor.v)
-  const maxGasLimit = pGasLimit + a
-  const minGasLimit = pGasLimit - a
-
-  return maxGasLimit > gasLimit && minGasLimit < gasLimit && params.minGasLimit.v < gasLimit
-}
-
-/**
- * Validates the entire block header
- * @method validate
- * @param {Blockchain} blockChain the blockchain that this block is validating against
- * @param {Bignum} [height] if this is an uncle header, this is the height of the block that is including it
- * @param {Function} cb the callback function. The callback is given an `error` if the block is invalid
- */
-BlockHeader.prototype.validate = function (blockchain, height, cb) {
-  var self = this
-  if (arguments.length === 2) {
-    cb = height
-    height = false
-  }
-
-  if (this.isGenesis()) {
-    return cb()
-  }
-
-  // find the blocks parent
-  blockchain.getBlock(self.parentHash, function (err, parentBlock) {
-    if (err) {
-      return cb('could not find parent block')
-    }
-
-    self.parentBlock = parentBlock
-
-    var number = new BN(self.number)
-    if (number.cmp(new BN(parentBlock.header.number).addn(1)) !== 0) {
-      return cb('invalid number')
-    }
-
-    if (height) {
-      var dif = height.sub(new BN(parentBlock.header.number))
-      if (!(dif.cmpn(8) === -1 && dif.cmpn(1) === 1)) {
-        return cb('uncle block has a parent that is too old or to young')
-      }
-    }
-
-    if (!self.validateDifficulty(parentBlock)) {
-      return cb('invalid Difficulty')
-    }
-
-    if (!self.validateGasLimit(parentBlock)) {
-      return cb('invalid gas limit')
-    }
-
-    if (utils.bufferToInt(parentBlock.header.number) + 1 !== utils.bufferToInt(self.number)) {
-      return cb('invalid heigth')
-    }
-
-    if (utils.bufferToInt(self.timestamp) <= utils.bufferToInt(parentBlock.header.timestamp)) {
-      return cb('invalid timestamp')
-    }
-
-    if (self.extraData.length > params.maximumExtraDataSize.v) {
-      return cb('invalid amount of extra data')
-    }
-
-    cb()
-  })
-}
-
-/**
- * Returns the sha3 hash of the blockheader
- * @method hash
- * @return {Buffer}
- */
-BlockHeader.prototype.hash = function () {
-  return utils.rlphash(this.raw)
-}
-
-/**
- * checks if the blockheader is a genesis header
- * @method isGenesis
- * @return {Boolean}
- */
-BlockHeader.prototype.isGenesis = function () {
-  return this.number.toString('hex') === ''
-}
-
-/**
- * Determines if a given block part of homestead or not
- * @method isHomestead
- * @return Boolean
- */
-BlockHeader.prototype.isHomestead = function () {
-  return utils.bufferToInt(this.number) >= params.homeSteadForkNumber.v
-}
-
-}).call(this,require("buffer").Buffer)
-},{"buffer":179,"ethereum-common":59,"ethereumjs-util":66}],63:[function(require,module,exports){
-(function (Buffer){
-const ethUtil = require('ethereumjs-util')
-const Tx = require('ethereumjs-tx')
-const Trie = require('merkle-patricia-tree')
-const BN = ethUtil.BN
-const rlp = ethUtil.rlp
-const async = require('async')
-const BlockHeader = require('./header')
-const params = require('ethereum-common')
-
-/**
- * Creates a new block object
- * @constructor the raw serialized or the deserialized block.
- * @param {Array|Buffer|Object} data
- * @prop {Header} header the block's header
- * @prop {Array.<Header>} uncleList an array of uncle headers
- * @prop {Array.<Buffer>} raw an array of buffers containing the raw blocks.
- */
-var Block = module.exports = function (data) {
-  this.transactions = []
-  this.uncleHeaders = []
-  this._inBlockChain = false
-  this.txTrie = new Trie()
-
-  Object.defineProperty(this, 'raw', {
-    get: function () {
-      return this.serialize(false)
-    }
-  })
-
-  var rawTransactions, rawUncleHeaders
-
-  // defaults
-  if (!data) {
-    data = [[], [], []]
-  }
-
-  if (Buffer.isBuffer(data)) {
-    data = rlp.decode(data)
-  }
-
-  if (Array.isArray(data)) {
-    this.header = new BlockHeader(data[0])
-    rawTransactions = data[1]
-    rawUncleHeaders = data[2]
-  } else {
-    this.header = new BlockHeader(data.header)
-    rawTransactions = data.transactions
-    rawUncleHeaders = data.uncleHeaders
-  }
-
-  // parse uncle headers
-  for (var i = 0; i < rawUncleHeaders.length; i++) {
-    this.uncleHeaders.push(new BlockHeader(rawUncleHeaders[i]))
-  }
-
-  var homestead = this.isHomestead()
-  // parse transactions
-  for (i = 0; i < rawTransactions.length; i++) {
-    var tx = new Tx(rawTransactions[i])
-    tx._homestead = homestead
-    this.transactions.push(tx)
-  }
-}
-
-/**
- * Produces a hash the RLP of the block
- * @method hash
- */
-Block.prototype.hash = function () {
-  return this.header.hash()
-}
-
-/**
- * Determines if a given block is the genesis block
- * @method isGenisis
- * @return Boolean
- */
-Block.prototype.isGenesis = function () {
-  return this.header.isGenesis()
-}
-
-/**
- * Determines if a given block part of homestead or not
- * @method isHomestead
- * @return Boolean
- */
-Block.prototype.isHomestead = function () {
-  return this.header.isHomestead()
-}
-
-/**
- * turns the block in to the canonical genesis block
- * @method setGenesisParams
- */
-Block.prototype.setGenesisParams = function () {
-  this.header.gasLimit = params.genesisGasLimit.v
-  this.header.difficulty = params.genesisDifficulty.v
-  this.header.extraData = params.genesisExtraData.v
-  this.header.nonce = params.genesisNonce.v
-  this.header.stateRoot = params.genesisStateRoot.v
-  this.header.number = new Buffer([])
-}
-
-/**
- * Produces a serialization of the block.
- * @method serialize
- * @param {Boolean} rlpEncode whether to rlp encode the block or not
- */
-Block.prototype.serialize = function (rlpEncode) {
-  var raw = [this.header.raw, [],
-    []
-  ]
-
-  // rlpEnode defaults to true
-  if (typeof rlpEncode === 'undefined') {
-    rlpEncode = true
-  }
-
-  this.transactions.forEach(function (tx) {
-    raw[1].push(tx.raw)
-  })
-
-  this.uncleHeaders.forEach(function (uncle) {
-    raw[2].push(uncle.raw)
-  })
-
-  return rlpEncode ? rlp.encode(raw) : raw
-}
-
-/**
- * Generate transaction trie. The tx trie must be generated before the transaction trie can
- * be validated with `validateTransactionTrie`
- * @method genTxTrie
- * @param {Function} cb the callback
- */
-Block.prototype.genTxTrie = function (cb) {
-  var i = 0
-  var self = this
-
-  async.eachSeries(this.transactions, function (tx, done) {
-    self.txTrie.put(rlp.encode(i), tx.serialize(), done)
-    i++
-  }, cb)
-}
-
-/**
- * Validates the transaction trie
- * @method validateTransactionTrie
- * @return {Boolean}
- */
-Block.prototype.validateTransactionsTrie = function () {
-  var txT = this.header.transactionsTrie.toString('hex')
-  if (this.transactions.length) {
-    return txT === this.txTrie.root.toString('hex')
-  } else {
-    return txT === ethUtil.SHA3_RLP.toString('hex')
-  }
-}
-
-/**
- * Validates the transactions
- * @method validateTransactions
- * @param {Boolean} [stringError=false] whether to return a string with a dscription of why the validation failed or return a Bloolean
- * @return {Boolean}
- */
-Block.prototype.validateTransactions = function (stringError) {
-  var errors = []
-
-  this.transactions.forEach(function (tx, i) {
-    var error = tx.validate(true)
-    if (error) {
-      error += ' at tx ' + i
-    }
-    errors.push(error)
-  })
-
-  if (stringError === undefined || stringError === false) {
-    return errors.length === 0
-  } else {
-    return arrayToString(errors)
-  }
-}
-
-/**
- * Validates the entire block. Returns a string to the callback if block is invalid
- * @method validate
- * @param {BlockChain} blockChain the blockchain that this block wants to be part of
- * @param {Function} cb the callback which is given a `String` if the block is not valid
- */
-Block.prototype.validate = function (blockChain, cb) {
-  var self = this
-  var errors = []
-
-  async.parallel([
-    // validate uncles
-    self.validateUncles.bind(self, blockChain),
-    // validate block
-    self.header.validate.bind(self.header, blockChain),
-    // generate the transaction trie
-    self.genTxTrie.bind(self)
-  ], function (err) {
-    if (err) {
-      errors.push(err)
-    }
-
-    if (!self.validateTransactionsTrie()) {
-      errors.push('invalid transaction true')
-    }
-
-    var txErrors = self.validateTransactions(true)
-    if (txErrors !== '') {
-      errors.push(txErrors)
-    }
-
-    if (!self.validateUnclesHash()) {
-      errors.push('invild uncle hash')
-    }
-
-    cb(arrayToString(errors))
-  })
-}
-
-/**
- * Validates the uncle's hash
- * @method validateUncleHash
- * @return {Boolean}
- */
-Block.prototype.validateUnclesHash = function () {
-  var raw = []
-  this.uncleHeaders.forEach(function (uncle) {
-    raw.push(uncle.raw)
-  })
-
-  raw = rlp.encode(raw)
-  return ethUtil.sha3(raw).toString('hex') === this.header.uncleHash.toString('hex')
-}
-
-/**
- * Validates the uncles that are in the block if any. Returns a string to the callback if uncles are invalid
- * @method validateUncles
- * @param {Blockchain} blockChaina an instance of the Blockchain
- * @param {Function} cb the callback
- */
-Block.prototype.validateUncles = function (blockChain, cb) {
-  if (this.isGenesis()) {
-    return cb()
-  }
-
-  var self = this
-
-  if (self.uncleHeaders.length > 2) {
-    return cb('too many uncle headers')
-  }
-
-  var uncleHashes = self.uncleHeaders.map(function (header) {
-    return header.hash().toString('hex')
-  })
-
-  if (!((new Set(uncleHashes)).size === uncleHashes.length)) {
-    return cb('dublicate unlces')
-  }
-
-  async.each(self.uncleHeaders, function (uncle, cb2) {
-    var height = new BN(self.header.number)
-    async.parallel([
-      uncle.validate.bind(uncle, blockChain, height),
-      // check to make sure the uncle is not already in the blockchain
-      function (cb3) {
-        blockChain.getDetails(uncle.hash(), function (err, blockInfo) {
-          // TODO: remove uncles from BC
-          if (blockInfo && blockInfo.isUncle) {
-            cb3(err || 'uncle already included')
-          } else {
-            cb3()
-          }
-        })
-      }
-    ], cb2)
-  }, cb)
-}
-
-/**
- * Converts the block toJSON
- * @method toJSON
- * @param {Bool} labeled whether to create an labeled object or an array
- * @return {Object}
- */
-Block.prototype.toJSON = function (labeled) {
-  if (labeled) {
-    var obj = {
-      header: this.header.toJSON(true),
-      transactions: [],
-      uncleHeaders: []
-    }
-
-    this.transactions.forEach(function (tx) {
-      obj.transactions.push(tx.toJSON(labeled))
-    })
-
-    this.uncleHeaders.forEach(function (uh) {
-      obj.uncleHeaders.push(uh.toJSON())
-    })
-    return obj
-  } else {
-    return ethUtil.baToJSON(this.raw)
-  }
-}
-
-function arrayToString (array) {
-  try {
-    return array.reduce(function (str, err) {
-      if (str) {
-        str += ' '
-      }
-      return str + err
-    })
-  } catch (e) {
-    return ''
-  }
-}
-
-}).call(this,require("buffer").Buffer)
-},{"./header":62,"async":30,"buffer":179,"ethereum-common":59,"ethereumjs-tx":64,"ethereumjs-util":66,"merkle-patricia-tree":105}],64:[function(require,module,exports){
+},{"./bootstrapNodes.json":42,"./genesisState.json":43,"./params.json":45}],45:[function(require,module,exports){
+arguments[4][37][0].apply(exports,arguments)
+},{"dup":37}],46:[function(require,module,exports){
 (function (global,Buffer){
 const ethUtil = require('ethereumjs-util')
-const fees = require('ethereum-common')
+const fees = require('ethereum-common/params')
 const BN = ethUtil.BN
 
 // secp256k1n/2
@@ -24025,7 +21137,7 @@ Transaction.prototype.validate = function (stringError) {
 }
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {},require("buffer").Buffer)
-},{"buffer":179,"ethereum-common":59,"ethereumjs-util":65}],65:[function(require,module,exports){
+},{"buffer":185,"ethereum-common/params":38,"ethereumjs-util":47}],47:[function(require,module,exports){
 (function (Buffer){
 const SHA3 = require('keccakjs')
 const secp256k1 = require('secp256k1')
@@ -24230,12 +21342,22 @@ exports.intToBuffer = function (i) {
  * @return {Number}
  */
 exports.bufferToInt = function (buf) {
+  return parseInt(exports.bufferToHex(buf), 16)
+}
+
+/**
+ * Converts a `Buffer` into a hex `String`
+ * @method bufferToHex
+ * @param {Buffer} buf
+ * @return {String}
+ */
+exports.bufferToHex = function (buf) {
   buf = exports.toBuffer(buf)
   if (buf.length === 0) {
     return 0
   }
 
-  return parseInt(buf.toString('hex'), 16)
+  return '0x' + buf.toString('hex')
 }
 
 /**
@@ -24315,6 +21437,16 @@ exports.rlphash = function (a) {
 }
 
 /**
+ * Checks if the private key satisfies the rules of the curve secp256k1.
+ * @method isValidPrivate
+ * @param {Buffer} privateKey
+ * @return {Boolean}
+ */
+exports.isValidPrivate = function (privateKey) {
+  return secp256k1.privateKeyVerify(privateKey)
+}
+
+/**
  * Returns the ethereum address of a given public key.
  * Accepts "Ethereum public keys" and SEC1 encoded keys.
  * @method publicToAddress
@@ -24355,6 +21487,16 @@ exports.privateToAddress = function (privateKey) {
 }
 
 /**
+ * Checks if the address is a valid. Accepts checksummed addresses too
+ * @method isValidAddress
+ * @param {String} address
+ * @return {Boolean}
+ */
+exports.isValidAddress = function (address) {
+  return /^0x[0-9a-fA-F]{40}$/i.test(address)
+}
+
+/**
  * Returns a checksummed address
  * @method toChecksumAddress
  * @param {String} address
@@ -24383,7 +21525,7 @@ exports.toChecksumAddress = function (address) {
  * @return {Boolean}
  */
 exports.isValidChecksumAddress = function (address) {
-  return exports.toChecksumAddress(address) === address
+  return exports.isValidAddress(address) && (exports.toChecksumAddress(address) === address)
 }
 
 /**
@@ -24497,8 +21639,8 @@ exports.ecsign = function (msgHash, privateKey) {
 exports.ecrecover = function (msgHash, v, r, s) {
   var signature = Buffer.concat([exports.setLength(r, 32), exports.setLength(s, 32)], 64)
   var recovery = exports.bufferToInt(v) - 27
-  if (v > 28 || v < 27) {
-    throw (new Error('Invalid v value'))
+  if (recovery !== 0 && recovery !== 1) {
+    throw new Error('Invalid signature v value')
   }
   var senderPubKey = secp256k1.recover(msgHash, signature, recovery)
   return secp256k1.publicKeyConvert(senderPubKey, false).slice(1)
@@ -24629,9 +21771,2901 @@ exports.defineProperties = function (self, fields, data) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"assert":149,"bn.js":31,"buffer":179,"crypto":188,"keccakjs":77,"rlp":124,"secp256k1":125}],66:[function(require,module,exports){
-arguments[4][65][0].apply(exports,arguments)
-},{"assert":149,"bn.js":31,"buffer":179,"crypto":188,"dup":65,"keccakjs":77,"rlp":124,"secp256k1":125}],67:[function(require,module,exports){
+},{"assert":155,"bn.js":11,"buffer":185,"crypto":194,"keccakjs":82,"rlp":129,"secp256k1":130}],48:[function(require,module,exports){
+module.exports = require('./lib/index.js')
+
+},{"./lib/index.js":53}],49:[function(require,module,exports){
+(function (Buffer){
+const assert = require('assert')
+const utils = require('ethereumjs-util')
+const byteSize = 256
+
+/**
+ * Represents a Bloom
+ * @constructor
+ * @param {Buffer} bitvector
+ */
+var Bloom = module.exports = function (bitvector) {
+  if (!bitvector) {
+    this.bitvector = utils.zeros(byteSize)
+  } else {
+    assert(bitvector.length === byteSize, 'bitvectors must be 2048 bits long')
+    this.bitvector = bitvector
+  }
+}
+
+/**
+ * adds an element to a bit vector of a 64 byte bloom filter
+ * @method add
+ * @param {Buffer} element
+ */
+Bloom.prototype.add = function (e) {
+  e = utils.sha3(e)
+  var mask = 2047 // binary 11111111111
+
+  for (var i = 0; i < 3; i++) {
+    var first2bytes = e.readUInt16BE(i * 2)
+    var loc = mask & first2bytes
+    var byteLoc = loc >> 3
+    var bitLoc = 1 << loc % 8
+    this.bitvector[byteSize - byteLoc - 1] |= bitLoc
+  }
+}
+
+/**
+ * checks if an element is in the blooom
+ * @method check
+ * @param {Buffer} element
+ */
+Bloom.prototype.check = function (e) {
+  e = utils.sha3(e)
+  var mask = 511 // binary 111111111
+  var match = true
+
+  for (var i = 0; i < 3 && match; i++) {
+    var first2bytes = e.readUInt16BE(i * 2)
+    var loc = mask & first2bytes
+    var byteLoc = loc >> 3
+    var bitLoc = 1 << loc % 8
+    match = (this.bitvector[byteSize - byteLoc - 1] & bitLoc)
+  }
+
+  return Boolean(match)
+}
+
+/**
+ * checks if multple topics are in a bloom
+ * @method check
+ * @param {Buffer} element
+ */
+Bloom.prototype.multiCheck = function (topics) {
+  var self = this
+  var match = true
+  topics.forEach(function (t) {
+    if (!Buffer.isBuffer(t)) {
+      t = new Buffer(t, 'hex')
+    }
+
+    match && self.check(t)
+  })
+
+  return match
+}
+
+/**
+ * bitwise or blooms together
+ * @method or
+ * @param {Bloom} bloom
+ */
+Bloom.prototype.or = function (bloom) {
+  if (bloom) {
+    for (var i = 0; i <= byteSize; i++) {
+      this.bitvector[i] = this.bitvector[i] | bloom.bitvector[i]
+    }
+  }
+}
+
+}).call(this,require("buffer").Buffer)
+},{"assert":155,"buffer":185,"ethereumjs-util":47}],50:[function(require,module,exports){
+(function (Buffer){
+const Tree = require('functional-red-black-tree')
+const Account = require('ethereumjs-account')
+const async = require('async')
+
+var Cache = module.exports = function (trie) {
+  this._cache = Tree()
+  this._checkpoints = []
+  this._deletes = []
+  this._trie = trie
+}
+
+Cache.prototype.put = function (key, val, fromTrie) {
+  var modified = !fromTrie
+  this._update(key, val, modified, true)
+}
+
+// returns the queried account or an empty account
+Cache.prototype.get = function (key) {
+  var account = this.lookup(key)
+  if (!account) {
+    account = new Account()
+    account.exists = false
+  }
+  return account
+}
+
+// returns the queried account or undefined
+Cache.prototype.lookup = function (key) {
+  key = key.toString('hex')
+
+  var it = this._cache.find(key)
+  if (it.node) {
+    var account = new Account(it.value.val)
+    account.exists = it.value.exists
+    return account
+  }
+}
+
+Cache.prototype._lookupAccount = function (address, cb) {
+  var self = this
+  self._trie.get(address, function (err, raw) {
+    if (err) return cb(err)
+    var account = new Account(raw)
+    var exists = !!raw
+    account.exists = exists
+    cb(null, account, exists)
+  })
+}
+
+Cache.prototype.getOrLoad = function (key, cb) {
+  var self = this
+  var account = this.lookup(key)
+  if (account) {
+    cb(null, account)
+  } else {
+    self._lookupAccount(key, function (err, account, exists) {
+      if (err) return cb(err)
+      self._update(key, account, false, exists)
+      cb(null, account)
+    })
+  }
+}
+
+Cache.prototype.warm = function (addresses, cb) {
+  var self = this
+  // shim till async supports iterators
+  var accountArr = []
+  addresses.forEach(function (val) {
+    if (val) accountArr.push(val)
+  })
+
+  async.eachSeries(accountArr, function (addressHex, done) {
+    var address = new Buffer(addressHex, 'hex')
+    self._lookupAccount(address, function (err, account) {
+      self._update(address, account, false, account.exists)
+      done(err)
+    })
+  }, cb)
+}
+
+Cache.prototype.flush = function (cb) {
+  var it = this._cache.begin
+  var self = this
+  var next = true
+  async.whilst(function () {
+    return next
+  }, function (done) {
+    if (it.value.modified) {
+      it.value.modified = false
+      it.value.val = it.value.val.serialize()
+      self._trie.put(new Buffer(it.key, 'hex'), it.value.val, function () {
+        next = it.hasNext
+        it.next()
+        done()
+      })
+    } else {
+      next = it.hasNext
+      it.next()
+      done()
+    }
+  }, function () {
+    async.eachSeries(self._deletes, function (address, done) {
+      self._trie.del(address, done)
+    }, function () {
+      self._deletes = []
+      cb()
+    })
+  })
+}
+
+Cache.prototype.checkpoint = function () {
+  this._checkpoints.push(this._cache)
+}
+
+Cache.prototype.revert = function () {
+  this._cache = this._checkpoints.pop(this._cache)
+}
+
+Cache.prototype.commit = function () {
+  this._checkpoints.pop()
+}
+
+Cache.prototype.clear = function () {
+  this._deletes = []
+  this._cache = Tree()
+}
+
+Cache.prototype.del = function (key) {
+  this._deletes.push(key)
+  key = key.toString('hex')
+  this._cache = this._cache.remove(key)
+}
+
+Cache.prototype._update = function (key, val, modified, exists) {
+  key = key.toString('hex')
+  var it = this._cache.find(key)
+  if (it.node) {
+    this._cache = it.update({
+      val: val,
+      modified: modified,
+      exists: true
+    })
+  } else {
+    this._cache = this._cache.insert(key, {
+      val: val,
+      modified: modified,
+      exists: exists
+    })
+  }
+}
+
+}).call(this,require("buffer").Buffer)
+},{"async":10,"buffer":185,"ethereumjs-account":39,"functional-red-black-tree":72}],51:[function(require,module,exports){
+exports.ERROR = {
+  OUT_OF_GAS: 'out of gas',
+  STACK_UNDERFLOW: 'stack underflow',
+  INVALID_JUMP: 'invalid JUMP',
+  INVALID_OPCODE: 'invalid opcode'
+}
+
+},{}],52:[function(require,module,exports){
+(function (Buffer){
+var utils = require('ethereumjs-util')
+
+module.exports = {
+  getBlock: function (n, cb) {
+    var hash = utils.sha3(new Buffer(utils.bufferToInt(n).toString()))
+
+    var block = {
+      hash: function () {
+        return hash
+      }
+    }
+
+    cb(null, block)
+  }
+}
+
+}).call(this,require("buffer").Buffer)
+},{"buffer":185,"ethereumjs-util":47}],53:[function(require,module,exports){
+const util = require('util')
+const StateManager = require('./stateManager.js')
+const AsyncEventEmitter = require('async-eventemitter')
+
+// require the percomiled contracts
+const num01 = require('./precompiled/01-ecrecover.js')
+const num02 = require('./precompiled/02-sha256.js')
+const num03 = require('./precompiled/03-ripemd160.js')
+const num04 = require('./precompiled/04-identity.js')
+
+module.exports = VM
+
+VM.deps = {
+  ethUtil: require('ethereumjs-util'),
+  Account: require('ethereumjs-account'),
+  Trie: require('merkle-patricia-tree'),
+  rlp: require('ethereumjs-util').rlp
+}
+
+/**
+ * @constructor
+ */
+function VM (trie, blockchain, opts) {
+  this.stateManager = new StateManager({
+    trie: trie,
+    blockchain: blockchain
+  })
+
+  // temporary
+  // this is here for a gradual transition to StateManager
+  this.blockchain = this.stateManager.blockchain
+  this.trie = this.stateManager.trie
+  this.opts = opts || {}
+
+  // precompiled contracts
+  this._precompiled = {}
+  this._precompiled['0000000000000000000000000000000000000001'] = num01
+  this._precompiled['0000000000000000000000000000000000000002'] = num02
+  this._precompiled['0000000000000000000000000000000000000003'] = num03
+  this._precompiled['0000000000000000000000000000000000000004'] = num04
+
+  AsyncEventEmitter.call(this)
+}
+
+util.inherits(VM, AsyncEventEmitter)
+
+VM.prototype.runCode = require('./runCode.js')
+VM.prototype.runJIT = require('./runJit.js')
+VM.prototype.runBlock = require('./runBlock.js')
+VM.prototype.runTx = require('./runTx.js')
+VM.prototype.runCall = require('./runCall.js')
+VM.prototype.runBlockchain = require('./runBlockchain.js')
+
+VM.prototype.copy = function () {
+  var trie = this.trie.copy()
+  return new VM(trie, this.blockchain)
+}
+
+/**
+ * Loads precompiled contracts into the state
+ */
+VM.prototype.loadCompiled = function (address, src, cb) {
+  this.trie.db.put(address, src, cb)
+}
+
+VM.prototype.populateCache = function (addresses, cb) {
+  this.stateManager.warmCache(addresses, cb)
+}
+
+},{"./precompiled/01-ecrecover.js":57,"./precompiled/02-sha256.js":58,"./precompiled/03-ripemd160.js":59,"./precompiled/04-identity.js":60,"./runBlock.js":61,"./runBlockchain.js":62,"./runCall.js":63,"./runCode.js":64,"./runJit.js":65,"./runTx.js":66,"./stateManager.js":67,"async-eventemitter":7,"ethereumjs-account":39,"ethereumjs-util":47,"merkle-patricia-tree":110,"util":275}],54:[function(require,module,exports){
+const utils = require('ethereumjs-util')
+const BN = utils.BN
+const pow32 = new BN('010000000000000000000000000000000000000000000000000000000000000000', 16)
+const pow31 = new BN('0100000000000000000000000000000000000000000000000000000000000000', 16)
+const pow30 = new BN('01000000000000000000000000000000000000000000000000000000000000', 16)
+const pow29 = new BN('010000000000000000000000000000000000000000000000000000000000', 16)
+const pow28 = new BN('0100000000000000000000000000000000000000000000000000000000', 16)
+const pow27 = new BN('01000000000000000000000000000000000000000000000000000000', 16)
+const pow26 = new BN('010000000000000000000000000000000000000000000000000000', 16)
+const pow25 = new BN('0100000000000000000000000000000000000000000000000000', 16)
+const pow24 = new BN('01000000000000000000000000000000000000000000000000', 16)
+const pow23 = new BN('010000000000000000000000000000000000000000000000', 16)
+const pow22 = new BN('0100000000000000000000000000000000000000000000', 16)
+const pow21 = new BN('01000000000000000000000000000000000000000000', 16)
+const pow20 = new BN('010000000000000000000000000000000000000000', 16)
+const pow19 = new BN('0100000000000000000000000000000000000000', 16)
+const pow18 = new BN('01000000000000000000000000000000000000', 16)
+const pow17 = new BN('010000000000000000000000000000000000', 16)
+const pow16 = new BN('0100000000000000000000000000000000', 16)
+const pow15 = new BN('01000000000000000000000000000000', 16)
+const pow14 = new BN('010000000000000000000000000000', 16)
+const pow13 = new BN('0100000000000000000000000000', 16)
+const pow12 = new BN('01000000000000000000000000', 16)
+const pow11 = new BN('010000000000000000000000', 16)
+const pow10 = new BN('0100000000000000000000', 16)
+const pow9 = new BN('01000000000000000000', 16)
+const pow8 = new BN('010000000000000000', 16)
+const pow7 = new BN('0100000000000000', 16)
+const pow6 = new BN('01000000000000', 16)
+const pow5 = new BN('010000000000', 16)
+const pow4 = new BN('0100000000', 16)
+const pow3 = new BN('01000000', 16)
+const pow2 = new BN('010000', 16)
+const pow1 = new BN('0100', 16)
+
+module.exports = function (a) {
+  if (a.cmp(pow1) === -1) {
+    return 0
+  } else if (a.cmp(pow2) === -1) {
+    return 1
+  } else if (a.cmp(pow3) === -1) {
+    return 2
+  } else if (a.cmp(pow4) === -1) {
+    return 3
+  } else if (a.cmp(pow5) === -1) {
+    return 4
+  } else if (a.cmp(pow6) === -1) {
+    return 5
+  } else if (a.cmp(pow7) === -1) {
+    return 6
+  } else if (a.cmp(pow8) === -1) {
+    return 7
+  } else if (a.cmp(pow9) === -1) {
+    return 8
+  } else if (a.cmp(pow10) === -1) {
+    return 9
+  } else if (a.cmp(pow11) === -1) {
+    return 10
+  } else if (a.cmp(pow12) === -1) {
+    return 11
+  } else if (a.cmp(pow13) === -1) {
+    return 12
+  } else if (a.cmp(pow14) === -1) {
+    return 13
+  } else if (a.cmp(pow15) === -1) {
+    return 14
+  } else if (a.cmp(pow16) === -1) {
+    return 15
+  } else if (a.cmp(pow17) === -1) {
+    return 16
+  } else if (a.cmp(pow18) === -1) {
+    return 17
+  } else if (a.cmp(pow19) === -1) {
+    return 18
+  } else if (a.cmp(pow20) === -1) {
+    return 19
+  } else if (a.cmp(pow21) === -1) {
+    return 20
+  } else if (a.cmp(pow22) === -1) {
+    return 21
+  } else if (a.cmp(pow23) === -1) {
+    return 22
+  } else if (a.cmp(pow24) === -1) {
+    return 23
+  } else if (a.cmp(pow25) === -1) {
+    return 24
+  } else if (a.cmp(pow26) === -1) {
+    return 25
+  } else if (a.cmp(pow27) === -1) {
+    return 26
+  } else if (a.cmp(pow28) === -1) {
+    return 27
+  } else if (a.cmp(pow29) === -1) {
+    return 28
+  } else if (a.cmp(pow30) === -1) {
+    return 29
+  } else if (a.cmp(pow31) === -1) {
+    return 30
+  } else if (a.cmp(pow32) === -1) {
+    return 31
+  } else {
+    return 32
+  }
+}
+
+},{"ethereumjs-util":47}],55:[function(require,module,exports){
+(function (Buffer){
+const async = require('async')
+const fees = require('ethereum-common')
+const utils = require('ethereumjs-util')
+const BN = utils.BN
+const constants = require('./constants.js')
+const logTable = require('./logTable.js')
+const ERROR = constants.ERROR
+const MAX_INT = 9007199254740991
+
+// the opcode functions
+module.exports = {
+  STOP: function (runState) {
+    runState.stopped = true
+  },
+  ADD: function (a, b, runState) {
+    return new Buffer(
+      new BN(a)
+        .add(new BN(b))
+        .mod(utils.TWO_POW256)
+        .toArray())
+  },
+  MUL: function (a, b, runState) {
+    return new Buffer(
+      new BN(a)
+        .mul(new BN(b))
+        .mod(utils.TWO_POW256)
+        .toArray()
+    )
+  },
+  SUB: function (a, b, runState) {
+    return utils.toUnsigned(
+      new BN(a)
+        .sub(new BN(b))
+    )
+  },
+  DIV: function (a, b, runState) {
+    a = new BN(a)
+    b = new BN(b)
+    var r
+    if (b.isZero()) {
+      r = [0]
+    } else {
+      r = a.div(b).toArray()
+    }
+    return new Buffer(r)
+  },
+  SDIV: function (a, b, runState) {
+    a = utils.fromSigned(a)
+    b = utils.fromSigned(b)
+
+    var r
+    if (b.isZero()) {
+      r = new Buffer([0])
+    } else {
+      r = utils.toUnsigned(a.div(b))
+    }
+
+    return r
+  },
+  MOD: function (a, b, runState) {
+    a = new BN(a)
+    b = new BN(b)
+    var r
+
+    if (b.isZero()) {
+      r = [0]
+    } else {
+      r = a.mod(b).toArray()
+    }
+
+    return new Buffer(r)
+  },
+  SMOD: function (a, b, runState) {
+    a = utils.fromSigned(a)
+    b = utils.fromSigned(b)
+    var r
+
+    if (b.isZero()) {
+      r = new Buffer([0])
+    } else {
+      r = a.abs().mod(b.abs())
+      if (a.isNeg()) {
+        r = r.neg()
+      }
+
+      r = utils.toUnsigned(r)
+    }
+    return r
+  },
+  ADDMOD: function (a, b, c, runState) {
+    a = new BN(a).add(new BN(b))
+    c = new BN(c)
+    var r
+
+    if (c.isZero()) {
+      r = [0]
+    } else {
+      r = a.mod(c).toArray()
+    }
+
+    return new Buffer(r)
+  },
+  MULMOD: function (a, b, c, runState) {
+    a = new BN(a).mul(new BN(b))
+    c = new BN(c)
+    var r
+
+    if (c.isZero()) {
+      r = [0]
+    } else {
+      r = a.mod(c).toArray()
+    }
+
+    return new Buffer(r)
+  },
+  EXP: function (base, exponent, runState) {
+    base = new BN(base)
+    exponent = new BN(exponent)
+    var m = BN.red(utils.TWO_POW256)
+    var result
+
+    base = base.toRed(m)
+
+    if (!exponent.isZero()) {
+      var bytes = 1 + logTable(exponent)
+      subGas(runState, new BN(bytes).muln(fees.expByteGas.v))
+      result = new Buffer(base.redPow(exponent).toArray())
+    } else {
+      result = new Buffer([1])
+    }
+
+    return result
+  },
+  SIGNEXTEND: function (k, runState) {
+    k = new BN(k)
+    var extendOnes = false
+
+    if (k.cmpn(31) <= 0) {
+      k = k.toNumber()
+
+      var val = new Buffer(utils.setLengthLeft(runState.stack.pop(), 32))
+
+      if (val[31 - k] & 0x80) {
+        extendOnes = true
+      }
+
+      // 31-k-1 since k-th byte shouldn't be modified
+      for (var i = 30 - k; i >= 0; i--) {
+        val[i] = extendOnes ? 0xff : 0
+      }
+
+      return val
+    }
+  },
+  // 0x10 range - bit ops
+  LT: function (a, b, runState) {
+    return new Buffer([
+      new BN(a)
+        .cmp(new BN(b)) === -1
+    ])
+  },
+  GT: function (a, b, runState) {
+    return new Buffer([
+      new BN(a)
+        .cmp(new BN(b)) === 1
+    ])
+  },
+  SLT: function (a, b, runState) {
+    runState.stack.push(
+      new Buffer([
+        utils.fromSigned(a)
+          .cmp(utils.fromSigned(b)) === -1
+      ])
+    )
+  },
+  SGT: function (a, b, runState) {
+    return new Buffer([
+      utils.fromSigned(a)
+        .cmp(utils.fromSigned(b)) === 1
+    ])
+  },
+  EQ: function (a, b, runState) {
+    a = utils.unpad(a)
+    b = utils.unpad(b)
+    return new Buffer([a.toString('hex') === b.toString('hex')])
+  },
+  ISZERO: function (a, runState) {
+    a = utils.bufferToInt(a)
+    return new Buffer([!a])
+  },
+  AND: function (a, b, runState) {
+    return new Buffer((
+    new BN(a)
+      .and(
+        new BN(b)
+    )
+      )
+      .toArray())
+  },
+  OR: function (a, b, runState) {
+    return new Buffer((
+    new BN(a)
+      .or(
+        new BN(b)
+    )
+      )
+      .toArray())
+  },
+  XOR: function (a, b, runState) {
+    return new Buffer((
+    new BN(a)
+      .xor(
+        new BN(b)
+    )
+      )
+      .toArray())
+  },
+  NOT: function (a, runState) {
+    return new Buffer(new BN(a).inotn(256).toArray())
+  },
+  BYTE: function (pos, word, runState) {
+    pos = utils.bufferToInt(pos)
+    word = utils.setLengthLeft(word, 32)
+    var byte
+
+    if (pos < 32) {
+      byte = utils.intToBuffer(word[pos])
+    } else {
+      byte = new Buffer([0])
+    }
+
+    return byte
+  },
+  // 0x20 range - crypto
+  SHA3: function (offset, length, runState) {
+    offset = utils.bufferToInt(offset)
+    length = utils.bufferToInt(length)
+    var data = memLoad(runState, offset, length)
+    // copy fee
+    subGas(runState, new BN(fees.sha3WordGas.v).imuln(Math.ceil(length / 32)))
+    return utils.sha3(data)
+  },
+  // 0x30 range - closure state
+  ADDRESS: function (runState) {
+    return runState.address
+  },
+  BALANCE: function (address, runState, cb) {
+    var stateManager = runState.stateManager
+    // stack to address
+    address = utils.setLengthLeft(address.slice(-20), 20)
+
+    // shortcut if current account
+    if (address.toString('hex') === runState.address.toString('hex')) {
+      cb(null, runState.contract.balance)
+      return
+    }
+
+    // otherwise load account then return balance
+    stateManager.getAccountBalance(address, cb)
+  },
+  ORIGIN: function (runState) {
+    return runState.origin
+  },
+  CALLER: function (runState) {
+    return runState.caller
+  },
+  CALLVALUE: function (runState) {
+    return runState.callValue
+  },
+  CALLDATALOAD: function (pos, runState) {
+    pos = utils.bufferToInt(pos)
+    var loaded = runState.callData.slice(pos, pos + 32)
+
+    loaded = loaded.length ? loaded : new Buffer([0])
+
+    return utils.setLengthRight(loaded, 32)
+  },
+  CALLDATASIZE: function (runState) {
+    if (runState.callData.length === 1 && runState.callData[0] === 0) {
+      return new Buffer([0])
+    } else {
+      return utils.intToBuffer(runState.callData.length)
+    }
+  },
+  CALLDATACOPY: function (memOffset, dataOffsetBuf, dataLength, runState) {
+    memOffset = utils.bufferToInt(memOffset)
+    dataLength = utils.bufferToInt(dataLength)
+    var dataOffset = utils.bufferToInt(dataOffsetBuf)
+
+    memStore(runState, memOffset, runState.callData, dataOffset, dataLength)
+    // sub the COPY fee
+    subGas(runState, new BN(Number(fees.copyGas.v) * Math.ceil(dataLength / 32)))
+  },
+  CODESIZE: function (runState) {
+    return utils.intToBuffer(runState.code.length)
+  },
+  CODECOPY: function (memOffset, codeOffset, length, runState) {
+    memOffset = utils.bufferToInt(memOffset)
+    codeOffset = utils.bufferToInt(codeOffset)
+    length = utils.bufferToInt(length)
+
+    memStore(runState, memOffset, runState.code, codeOffset, length)
+    // sub the COPY fee
+    subGas(runState, new BN(fees.copyGas.v * Math.ceil(length / 32)))
+  },
+  EXTCODESIZE: function (address, runState, cb) {
+    var stateManager = runState.stateManager
+    address = address.slice(-20)
+    stateManager.getContractCode(address, function (err, code) {
+      cb(err, utils.intToBuffer(code.length))
+    })
+  },
+  EXTCODECOPY: function (address, memOffset, codeOffset, length, runState, cb) {
+    var stateManager = runState.stateManager
+    address = address.slice(-20)
+    memOffset = utils.bufferToInt(memOffset)
+    codeOffset = utils.bufferToInt(codeOffset)
+    length = utils.bufferToInt(length)
+    subMemUsage(runState, memOffset, length)
+
+    // copy fee
+    subGas(runState, new BN(fees.copyGas.v).imuln(Math.ceil(length / 32)))
+
+    stateManager.getContractCode(address, function (err, code) {
+      code = err ? new Buffer([0]) : code
+      memStore(runState, memOffset, code, codeOffset, length, false)
+      cb(err)
+    })
+  },
+  GASPRICE: function (runState) {
+    runState.stack.push(runState.gasPrice)
+  },
+  // '0x40' range - block operations
+  BLOCKHASH: function (number, runState, cb) {
+    var stateManager = runState.stateManager
+    number = utils.bufferToInt(number)
+    var diff = utils.bufferToInt(runState.block.header.number) - utils.bufferToInt(number)
+
+    // block lookups must be within the past 256 blocks
+    if (diff > 256 || diff <= 0) {
+      cb(null, new Buffer([0]))
+      return
+    }
+
+    stateManager.getBlockHash(number, function (err, blockHash) {
+      if (err) {
+        // if we are at a low block height and request a blockhash before the genesis block
+        cb(null, new Buffer([0]))
+      } else {
+        cb(null, blockHash)
+      }
+    })
+  },
+  COINBASE: function (runState) {
+    return runState.block.header.coinbase
+  },
+  TIMESTAMP: function (runState) {
+    return runState.block.header.timestamp
+  },
+  NUMBER: function (runState) {
+    return runState.block.header.number
+  },
+  DIFFICULTY: function (runState) {
+    return runState.block.header.difficulty
+  },
+  GASLIMIT: function (runState) {
+    return runState.block.header.gasLimit
+  },
+  // 0x50 range - 'storage' and execution
+  POP: function () {},
+  MLOAD: function (pos, runState) {
+    pos = utils.bufferToInt(pos)
+    var loaded = utils.unpad(memLoad(runState, pos, 32))
+    return loaded
+  },
+  MSTORE: function (offset, word, runState) {
+    offset = utils.bufferToInt(offset)
+    word = utils.setLengthLeft(word, 32)
+    memStore(runState, offset, word, 0, 32)
+  },
+  MSTORE8: function (offset, byte, runState) {
+    offset = utils.bufferToInt(offset)
+    // grab the last byte
+    byte = byte.slice(byte.length - 1)
+    memStore(runState, offset, byte, 0, 1)
+  },
+  SLOAD: function (key, runState, cb) {
+    var stateManager = runState.stateManager
+    key = utils.setLengthLeft(key, 32)
+
+    stateManager.getContractStorage(runState.address, key, function (err, value) {
+      if (err) return cb(err)
+      value = value.length ? value : new Buffer([0])
+      cb(null, value)
+    })
+  },
+  SSTORE: function (key, val, runState, cb) {
+    var stateManager = runState.stateManager
+    var address = runState.address
+    key = utils.setLengthLeft(key, 32)
+    var value = utils.unpad(val)
+
+    stateManager.getContractStorage(runState.address, key, function (err, found) {
+      if (err) return cb(err)
+      try {
+        if (value.length === 0 && !found.length) {
+          subGas(runState, new BN(fees.sstoreResetGas.v))
+        } else if (value.length === 0 && found.length) {
+          subGas(runState, new BN(fees.sstoreResetGas.v))
+          runState.gasRefund.iadd(new BN(fees.sstoreRefundGas.v))
+        } else if (value.length !== 0 && !found.length) {
+          subGas(runState, new BN(fees.sstoreSetGas.v))
+        } else if (value.length !== 0 && found.length) {
+          subGas(runState, new BN(fees.sstoreResetGas.v))
+        }
+      } catch (e) {
+        cb(e.error)
+        return
+      }
+
+      stateManager.putContractStorage(address, key, value, function (err) {
+        if (err) return cb(err)
+        runState.contract = stateManager.cache.get(address)
+        cb()
+      })
+    })
+  },
+  JUMP: function (dest, runState) {
+    dest = utils.bufferToInt(dest)
+
+    if (!jumpIsValid(runState, dest)) {
+      trap(ERROR.INVALID_JUMP)
+    }
+
+    runState.programCounter = dest
+  },
+  JUMPI: function (c, i, runState) {
+    c = utils.bufferToInt(c)
+    i = utils.bufferToInt(i)
+
+    var dest = i ? c : runState.programCounter
+
+    if (i && !jumpIsValid(runState, dest)) {
+      trap(ERROR.INVALID_JUMP)
+    }
+
+    runState.programCounter = dest
+  },
+  PC: function (runState) {
+    return utils.intToBuffer(runState.programCounter - 1)
+  },
+  MSIZE: function (runState) {
+    return utils.intToBuffer(runState.memoryWordCount * 32)
+  },
+  GAS: function (runState) {
+    return new Buffer(runState.gasLeft.toArray())
+  },
+  JUMPDEST: function (runState) {},
+  PUSH: function (runState) {
+    var numToPush = runState.opCode - 0x5f
+    var loaded = utils.unpad(runState.code.slice(runState.programCounter, runState.programCounter + numToPush))
+    runState.programCounter += numToPush
+    return loaded
+  },
+  DUP: function (runState) {
+    const stackPos = runState.opCode - 0x7f
+
+    if (stackPos > runState.stack.length) {
+      trap(ERROR.STACK_UNDERFLOW)
+    }
+
+    // dupilcated stack items point to the same Buffer
+    return runState.stack[runState.stack.length - stackPos]
+  },
+  SWAP: function (runState) {
+    var stackPos = runState.opCode - 0x8f
+
+    // check the stack to make sure we have enough items on teh stack
+    var swapIndex = runState.stack.length - stackPos - 1
+    if (swapIndex < 0) {
+      trap(ERROR.STACK_UNDERFLOW)
+    }
+
+    // preform the swap
+    var newTop = runState.stack[swapIndex]
+    runState.stack[swapIndex] = runState.stack.pop()
+    return newTop
+  },
+  LOG: function (memOffset, memLength) {
+    var args = Array.prototype.slice.call(arguments, 0)
+    args.pop() // pop off callback
+    var runState = args.pop()
+    var topics = args.slice(2)
+    topics = topics.map(function (a) {
+      return utils.setLengthLeft(a, 32)
+    })
+
+    memOffset = utils.bufferToInt(memOffset)
+    memLength = utils.bufferToInt(memLength)
+    const numOfTopics = runState.opCode - 0xa0
+    const mem = memLoad(runState, memOffset, memLength)
+    subGas(runState, new BN(numOfTopics * fees.logTopicGas.v + memLength * fees.logDataGas.v))
+
+    // add address
+    var log = [runState.address]
+    log.push(topics)
+
+    // add data
+    log.push(mem)
+    runState.logs.push(log)
+  },
+
+  // '0xf0' range - closures
+  CREATE: function (value, offset, length, runState, done) {
+    value = new BN(value)
+    offset = utils.bufferToInt(offset)
+    length = utils.bufferToInt(length)
+    // set up config
+    var options = {
+      value: value
+    }
+    var localOpts = {
+      inOffset: offset,
+      inLength: length
+    }
+
+    checkCallMemCost(runState, options, localOpts)
+    makeCall(runState, options, localOpts, done)
+  },
+  CALL: function (gasLimit, toAddress, value, inOffset, inLength, outOffset, outLength, runState, done) {
+    var stateManager = runState.stateManager
+    gasLimit = new BN(gasLimit)
+    toAddress = utils.setLengthLeft(toAddress, 20)
+    value = new BN(value)
+    inOffset = utils.bufferToInt(inOffset)
+    inLength = utils.bufferToInt(inLength)
+    outOffset = utils.bufferToInt(outOffset)
+    outLength = utils.bufferToInt(outLength)
+    var data = memLoad(runState, inOffset, inLength)
+    var options = {
+      gasLimit: gasLimit,
+      value: value,
+      to: toAddress,
+      data: data
+    }
+    var localOpts = {
+      inOffset: inOffset,
+      inLength: inLength,
+      outOffset: outOffset,
+      outLength: outLength
+    }
+
+    // add stipend
+    if (!value.isZero()) {
+      runState.gasLeft.iadd(new BN(fees.callStipend.v))
+      subGas(runState, new BN(fees.callValueTransferGas.v))
+      options.gasLimit.iadd(new BN(fees.callStipend.v))
+    }
+
+    checkCallMemCost(runState, options, localOpts)
+
+    stateManager.exists(toAddress, function (err, exists) {
+      if (err) {
+        done(err)
+        return
+      }
+      if (!exists) {
+        // can't wrap because we are in a callback
+        runState.gasLeft.isub(new BN(fees.callNewAccountGas.v))
+      }
+      makeCall(runState, options, localOpts, done)
+    })
+  },
+  CALLCODE: function (gas, toAddress, value, inOffset, inLength, outOffset, outLength, runState, done) {
+    var stateManager = runState.stateManager
+    gas = new BN(gas)
+    toAddress = utils.setLengthLeft(toAddress, 20)
+    value = new BN(value)
+    inOffset = utils.bufferToInt(inOffset)
+    inLength = utils.bufferToInt(inLength)
+    outOffset = utils.bufferToInt(outOffset)
+    outLength = utils.bufferToInt(outLength)
+
+    const options = {
+      gasLimit: gas,
+      value: value,
+      to: runState.address
+    }
+
+    const localOpts = {
+      inOffset: inOffset,
+      inLength: inLength,
+      outOffset: outOffset,
+      outLength: outLength
+    }
+
+    // add stipend
+    if (!value.isZero()) {
+      runState.gasLeft.isub(new BN(fees.callValueTransferGas.v)).iadd(new BN(fees.callStipend.v))
+      options.gasLimit.iadd(new BN(fees.callStipend.v))
+    }
+
+    checkCallMemCost(runState, options, localOpts)
+
+    // load the code
+    stateManager.getAccount(toAddress, function (err, account) {
+      if (err) return done(err)
+      if (utils.isPrecompiled(toAddress)) {
+        options.compiled = true
+        options.code = runState._precompiled[toAddress.toString('hex')]
+        makeCall(runState, options, localOpts, done)
+      } else {
+        stateManager.getContractCode(toAddress, function (err, code, compiled) {
+          if (err) return done(err)
+          options.code = code
+          options.compiled = compiled
+          makeCall(runState, options, localOpts, done)
+        })
+      }
+    })
+  },
+  DELEGATECALL: function (gas, toAddress, inOffset, inLength, outOffset, outLength, runState, done) {
+    var stateManager = runState.stateManager
+    var value = runState.callValue
+    gas = new BN(gas)
+    toAddress = utils.setLengthLeft(toAddress, 20)
+    inOffset = utils.bufferToInt(inOffset)
+    inLength = utils.bufferToInt(inLength)
+    outOffset = utils.bufferToInt(outOffset)
+    outLength = utils.bufferToInt(outLength)
+
+    const options = {
+      gasLimit: gas,
+      value: value,
+      to: runState.address,
+      caller: runState.caller
+    }
+
+    const localOpts = {
+      inOffset: inOffset,
+      inLength: inLength,
+      outOffset: outOffset,
+      outLength: outLength
+    }
+
+    checkCallMemCost(runState, options, localOpts)
+
+    // load the code
+    stateManager.getAccount(toAddress, function (err, account) {
+      if (err) return done(err)
+      if (utils.isPrecompiled(toAddress)) {
+        options.compiled = true
+        options.code = runState._precompiled[toAddress.toString('hex')]
+        makeCall(runState, options, localOpts, done)
+      } else {
+        stateManager.getContractCode(toAddress, function (err, code, compiled) {
+          if (err) return done(err)
+          options.code = code
+          options.compiled = compiled
+          makeCall(runState, options, localOpts, done)
+        })
+      }
+    })
+  },
+  RETURN: function (offset, length, runState) {
+    offset = utils.bufferToInt(offset)
+    length = utils.bufferToInt(length)
+    runState.returnValue = memLoad(runState, offset, length)
+  },
+  // '0x70', range - other
+  SUICIDE: function (suicideToAddress, runState, cb) {
+    var stateManager = runState.stateManager
+    var contract = runState.contract
+    var contractAddress = runState.address
+    suicideToAddress = utils.setLengthLeft(suicideToAddress, 20)
+
+    // only add to refund if this is the first suicide for the address
+    if (!runState.suicides[contractAddress.toString('hex')]) {
+      runState.gasRefund = runState.gasRefund.add(new BN(fees.suicideRefundGas.v))
+    }
+
+    runState.suicideTo = suicideToAddress
+    runState.suicides[contractAddress.toString('hex')] = suicideToAddress
+    runState.stopped = true
+
+    stateManager.getAccount(suicideToAddress, function (err, toAccount) {
+      // update balances
+      if (err) {
+        cb(err)
+        return
+      }
+      var newBalance = new Buffer(new BN(contract.balance).add(new BN(toAccount.balance)).toArray())
+      async.series([
+        stateManager.putAccountBalance.bind(stateManager, suicideToAddress, newBalance),
+        stateManager.putAccountBalance.bind(stateManager, contractAddress, new BN(0))
+      ], cb)
+    })
+  }
+}
+
+module.exports._DC = module.exports.DELEGATECALL
+
+function subGas (runState, amount) {
+  runState.gasLeft.isub(amount)
+  if (runState.gasLeft.cmpn(0) === -1) {
+    trap(ERROR.OUT_OF_GAS)
+  }
+}
+
+function trap (err) {
+  function VmError (error) {
+    this.error = error
+  }
+  throw new VmError(err)
+}
+
+/**
+ * Subtracts the amount needed for memory usage from `runState.gasLeft`
+ * @method subMemUsage
+ * @param {Number} offset
+ * @param {Number} length
+ * @return {String}
+ */
+function subMemUsage (runState, offset, length) {
+  //  abort if no usage
+  if (!length) return
+
+  // hacky: if the dataOffset is larger than the largest safeInt then just
+  // load 0's because if tx.data did have that amount of data then the fee
+  // would be high than the maxGasLimit in the block
+  if (offset > MAX_INT || length > MAX_INT) {
+    trap(ERROR.OUT_OF_GAS)
+  }
+
+  var newMemoryWordCount = Math.ceil((offset + length) / 32)
+  runState.memoryWordCount = Math.max(newMemoryWordCount, runState.memoryWordCount)
+  var words = new BN(newMemoryWordCount)
+  var fee = new BN(fees.memoryGas.v)
+  var quadCoeff = new BN(fees.quadCoeffDiv.v)
+  var cost = words.mul(fee).add(words.mul(words).div(quadCoeff))
+
+  if (cost.cmp(runState.highestMemCost) === 1) {
+    subGas(runState, cost.sub(runState.highestMemCost))
+    runState.highestMemCost = cost
+  }
+}
+
+/**
+ * Loads bytes from memory and returns them as a buffer. If an error occurs
+ * a string is instead returned. The function also subtracts the amount of
+ * gas need for memory expansion.
+ * @method memLoad
+ * @param {Number} offset where to start reading from
+ * @param {Number} length how far to read
+ * @return {Buffer|String}
+ */
+function memLoad (runState, offset, length) {
+  // check to see if we have enougth gas for the mem read
+  subMemUsage(runState, offset, length)
+  var loaded = runState.memory.slice(offset, offset + length)
+  // fill the remaining lenth with zeros
+  for (var i = loaded.length; i < length; i++) {
+    loaded.push(0)
+  }
+  return new Buffer(loaded)
+}
+
+/**
+ * Stores bytes to memory. If an error occurs a string is instead returned.
+ * The function also subtracts the amount of gas need for memory expansion.
+ * @method memStore
+ * @param {Number} offset where to start reading from
+ * @param {Number} length how far to read
+ * @return {Buffer|String}
+ */
+function memStore (runState, offset, val, valOffset, length, skipSubMem) {
+  if (skipSubMem !== false) {
+    subMemUsage(runState, offset, length)
+  }
+
+  for (var i = 0; i < length; i++) {
+    runState.memory[offset + i] = val[valOffset + i]
+  }
+}
+
+// checks if a jump is valid given a destination
+function jumpIsValid (runState, dest) {
+  return runState.validJumps.indexOf(dest) !== -1
+}
+
+// checks to see if we have enough gas left for the memory reads and writes
+// required by the CALLs
+function checkCallMemCost (runState, callOptions, localOpts) {
+  // calculates the gase need for reading the input from memory
+  callOptions.data = memLoad(runState, localOpts.inOffset, localOpts.inLength)
+
+  // calculates the gas need for saving the output in memory
+  if (localOpts.outLength) {
+    subMemUsage(runState, localOpts.outOffset, localOpts.outLength)
+  }
+
+  if (!callOptions.gasLimit) {
+    callOptions.gasLimit = runState.gasLeft
+  }
+
+  if (runState.gasLeft.cmp(callOptions.gasLimit) === -1) {
+    trap(ERROR.OUT_OF_GAS)
+  }
+}
+
+// sets up and calls runCall
+function makeCall (runState, callOptions, localOpts, cb) {
+  callOptions.caller = callOptions.caller || runState.address
+  callOptions.origin = runState.origin
+  callOptions.gasPrice = runState.gasPrice
+  callOptions.block = runState.block
+  callOptions.populateCache = false
+  callOptions.suicides = runState.suicides
+
+  // increment the runState.depth
+  callOptions.depth = runState.depth + 1
+
+  // check if account has enough ether
+  if (runState.depth >= fees.stackLimit.v || new BN(runState.contract.balance).cmp(callOptions.value) === -1) {
+    runState.stack.push(new Buffer([0]))
+    cb()
+  } else {
+    // if creating a new contract then increament the nonce
+    if (!callOptions.to) {
+      runState.contract.nonce = new BN(runState.contract.nonce).addn(1)
+    }
+
+    runState.stateManager.cache.put(runState.address, runState.contract)
+    runState._vm.runCall(callOptions, parseCallResults)
+  }
+
+  function parseCallResults (err, results) {
+    // concat the runState.logs
+    if (results.vm.logs) {
+      runState.logs = runState.logs.concat(results.vm.logs)
+    }
+
+    // add gasRefund
+    if (results.vm.gasRefund) {
+      runState.gasRefund = runState.gasRefund.add(results.vm.gasRefund)
+    }
+
+    // this should always be safe
+    runState.gasLeft.isub(results.gasUsed)
+
+    if (!results.vm.exceptionError) {
+      // save results to memory
+      if (results.vm.return) {
+        for (var i = 0; i < Math.min(localOpts.outLength, results.vm.return.length); i++) {
+          runState.memory[localOpts.outOffset + i] = results.vm.return[i]
+        }
+      }
+
+      // update stateRoot on current contract
+      runState.stateManager.getAccount(runState.address, function (err, account) {
+        runState.contract = account
+        // push the created address to the stack
+        if (results.createdAddress) {
+          cb(err, results.createdAddress)
+        } else {
+          cb(err, new Buffer([results.vm.exception]))
+        }
+      })
+    } else {
+      // creation failed so don't increament the nonce
+      if (results.vm.createdAddress) {
+        runState.contract.nonce = new BN(runState.contract.nonce).subn(1)
+      }
+
+      cb(err, new Buffer([results.vm.exception]))
+    }
+  }
+}
+
+}).call(this,require("buffer").Buffer)
+},{"./constants.js":51,"./logTable.js":54,"async":10,"buffer":185,"ethereum-common":70,"ethereumjs-util":47}],56:[function(require,module,exports){
+const codes = {
+  // 0x0 range - arithmetic ops
+  // name, baseCost, off stack, on stack, dynamic
+  0x00: ['STOP', 0, 0, 0, false],
+  0x01: ['ADD', 3, 2, 1, false],
+  0x02: ['MUL', 5, 2, 1, false],
+  0x03: ['SUB', 3, 2, 1, false],
+  0x04: ['DIV', 5, 2, 1, false],
+  0x05: ['SDIV', 5, 2, 1, false],
+  0x06: ['MOD', 5, 2, 1, false],
+  0x07: ['SMOD', 5, 2, 1, false],
+  0x08: ['ADDMOD', 8, 3, 1, false],
+  0x09: ['MULMOD', 8, 3, 1, false],
+  0x0a: ['EXP', 10, 2, 1, false],
+  0x0b: ['SIGNEXTEND', 5, 1, 1, false],
+
+  // 0x10 range - bit ops
+  0x10: ['LT', 3, 2, 1, false],
+  0x11: ['GT', 3, 2, 1, false],
+  0x12: ['SLT', 3, 2, 1, false],
+  0x13: ['SGT', 3, 2, 1, false],
+  0x14: ['EQ', 3, 2, 1, false],
+  0x15: ['ISZERO', 3, 1, 1, false],
+  0x16: ['AND', 3, 2, 1, false],
+  0x17: ['OR', 3, 2, 1, false],
+  0x18: ['XOR', 3, 2, 1, false],
+  0x19: ['NOT', 3, 1, 1, false],
+  0x1a: ['BYTE', 3, 2, 1, false],
+
+  // 0x20 range - crypto
+  0x20: ['SHA3', 30, 2, 1, false],
+
+  // 0x30 range - closure state
+  0x30: ['ADDRESS', 2, 0, 1, true],
+  0x31: ['BALANCE', 20, 1, 1, true],
+  0x32: ['ORIGIN', 2, 0, 1, true],
+  0x33: ['CALLER', 2, 0, 1, true],
+  0x34: ['CALLVALUE', 2, 0, 1, true],
+  0x35: ['CALLDATALOAD', 3, 1, 1, true],
+  0x36: ['CALLDATASIZE', 2, 0, 1, true],
+  0x37: ['CALLDATACOPY', 3, 3, 0, true],
+  0x38: ['CODESIZE', 2, 0, 1, false],
+  0x39: ['CODECOPY', 3, 3, 0, false],
+  0x3a: ['GASPRICE', 2, 0, 1, false],
+  0x3b: ['EXTCODESIZE', 20, 1, 1, true],
+  0x3c: ['EXTCODECOPY', 20, 4, 0, true],
+
+  // '0x40' range - block operations
+  0x40: ['BLOCKHASH', 20, 1, 1, true],
+  0x41: ['COINBASE', 2, 0, 1, true],
+  0x42: ['TIMESTAMP', 2, 0, 1, true],
+  0x43: ['NUMBER', 2, 0, 1, true],
+  0x44: ['DIFFICULTY', 2, 0, 1, true],
+  0x45: ['GASLIMIT', 2, 0, 1, true],
+
+  // 0x50 range - 'storage' and execution
+  0x50: ['POP', 2, 1, 0, false],
+  0x51: ['MLOAD', 3, 1, 1, false],
+  0x52: ['MSTORE', 3, 2, 0, false],
+  0x53: ['MSTORE8', 3, 2, 0, false],
+  0x54: ['SLOAD', 50, 1, 1, true],
+  0x55: ['SSTORE', 0, 2, 0, true],
+  0x56: ['JUMP', 8, 1, 0, false],
+  0x57: ['JUMPI', 10, 2, 0, false],
+  0x58: ['PC', 2, 0, 1, false],
+  0x59: ['MSIZE', 2, 0, 1, false],
+  0x5a: ['GAS', 2, 0, 1, false],
+  0x5b: ['JUMPDEST', 1, 0, 0, false],
+
+  // 0x60, range
+  0x60: ['PUSH', 3, 0, 1, false],
+  0x61: ['PUSH', 3, 0, 1, false],
+  0x62: ['PUSH', 3, 0, 1, false],
+  0x63: ['PUSH', 3, 0, 1, false],
+  0x64: ['PUSH', 3, 0, 1, false],
+  0x65: ['PUSH', 3, 0, 1, false],
+  0x66: ['PUSH', 3, 0, 1, false],
+  0x67: ['PUSH', 3, 0, 1, false],
+  0x68: ['PUSH', 3, 0, 1, false],
+  0x69: ['PUSH', 3, 0, 1, false],
+  0x6a: ['PUSH', 3, 0, 1, false],
+  0x6b: ['PUSH', 3, 0, 1, false],
+  0x6c: ['PUSH', 3, 0, 1, false],
+  0x6d: ['PUSH', 3, 0, 1, false],
+  0x6e: ['PUSH', 3, 0, 1, false],
+  0x6f: ['PUSH', 3, 0, 1, false],
+  0x70: ['PUSH', 3, 0, 1, false],
+  0x71: ['PUSH', 3, 0, 1, false],
+  0x72: ['PUSH', 3, 0, 1, false],
+  0x73: ['PUSH', 3, 0, 1, false],
+  0x74: ['PUSH', 3, 0, 1, false],
+  0x75: ['PUSH', 3, 0, 1, false],
+  0x76: ['PUSH', 3, 0, 1, false],
+  0x77: ['PUSH', 3, 0, 1, false],
+  0x78: ['PUSH', 3, 0, 1, false],
+  0x79: ['PUSH', 3, 0, 1, false],
+  0x7a: ['PUSH', 3, 0, 1, false],
+  0x7b: ['PUSH', 3, 0, 1, false],
+  0x7c: ['PUSH', 3, 0, 1, false],
+  0x7d: ['PUSH', 3, 0, 1, false],
+  0x7e: ['PUSH', 3, 0, 1, false],
+  0x7f: ['PUSH', 3, 0, 1, false],
+
+  0x80: ['DUP', 3, 0, 1, false],
+  0x81: ['DUP', 3, 0, 1, false],
+  0x82: ['DUP', 3, 0, 1, false],
+  0x83: ['DUP', 3, 0, 1, false],
+  0x84: ['DUP', 3, 0, 1, false],
+  0x85: ['DUP', 3, 0, 1, false],
+  0x86: ['DUP', 3, 0, 1, false],
+  0x87: ['DUP', 3, 0, 1, false],
+  0x88: ['DUP', 3, 0, 1, false],
+  0x89: ['DUP', 3, 0, 1, false],
+  0x8a: ['DUP', 3, 0, 1, false],
+  0x8b: ['DUP', 3, 0, 1, false],
+  0x8c: ['DUP', 3, 0, 1, false],
+  0x8d: ['DUP', 3, 0, 1, false],
+  0x8e: ['DUP', 3, 0, 1, false],
+  0x8f: ['DUP', 3, 0, 1, false],
+
+  0x90: ['SWAP', 3, 0, 0, false],
+  0x91: ['SWAP', 3, 0, 0, false],
+  0x92: ['SWAP', 3, 0, 0, false],
+  0x93: ['SWAP', 3, 0, 0, false],
+  0x94: ['SWAP', 3, 0, 0, false],
+  0x95: ['SWAP', 3, 0, 0, false],
+  0x96: ['SWAP', 3, 0, 0, false],
+  0x97: ['SWAP', 3, 0, 0, false],
+  0x98: ['SWAP', 3, 0, 0, false],
+  0x99: ['SWAP', 3, 0, 0, false],
+  0x9a: ['SWAP', 3, 0, 0, false],
+  0x9b: ['SWAP', 3, 0, 0, false],
+  0x9c: ['SWAP', 3, 0, 0, false],
+  0x9d: ['SWAP', 3, 0, 0, false],
+  0x9e: ['SWAP', 3, 0, 0, false],
+  0x9f: ['SWAP', 3, 0, 0, false],
+
+  0xa0: ['LOG', 375, 2, 0, false],
+  0xa1: ['LOG', 375, 3, 0, false],
+  0xa2: ['LOG', 375, 4, 0, false],
+  0xa3: ['LOG', 375, 5, 0, false],
+  0xa4: ['LOG', 375, 6, 0, false],
+
+  // '0xf0' range - closures
+  0xf0: ['CREATE', 32000, 3, 1, true],
+  0xf1: ['CALL', 40, 7, 1, true],
+  0xf2: ['CALLCODE', 40, 7, 1, true],
+  0xf3: ['RETURN', 0, 2, 0, false],
+  0xf4: ['DELEGATECALL', 40, 6, 1, true],
+
+  // '0x70', range - other
+  0xff: ['SUICIDE', 0, 1, 0, false]
+}
+
+module.exports = function (op, full) {
+  var code = codes[op] ? codes[op] : ['INVALID', 0]
+  var opcode = code[0]
+
+  if (full) {
+    if (opcode === 'LOG') {
+      opcode += op - 0xa0
+    }
+
+    if (opcode === 'PUSH') {
+      opcode += op - 0x5f
+    }
+
+    if (opcode === 'DUP') {
+      opcode += op - 0x7f
+    }
+
+    if (opcode === 'SWAP') {
+      opcode += op - 0x8f
+    }
+  }
+
+  return {name: opcode, fee: code[1], in: code[2], out: code[3], dynamic: code[4], async: code[5]}
+}
+
+},{}],57:[function(require,module,exports){
+const utils = require('ethereumjs-util')
+const BN = utils.BN
+const error = require('../constants.js').ERROR
+const fees = require('ethereum-common')
+
+module.exports = function (opts) {
+  var results = {}
+
+  results.gasUsed = new BN(fees.ecrecoverGas.v)
+
+  if (opts.gasLimit.cmp(results.gasUsed) === -1) {
+    results.gasUsed = opts.gasLimit
+    results.exception = 0 // 0 means VM fail (in this case because of OOG)
+    results.exceptionError = error.OUT_OF_GAS
+    return results
+  }
+
+  var data = utils.setLengthRight(opts.data, 128)
+
+  var msgHash = data.slice(0, 32)
+  var v = data.slice(32, 64)
+  var r = data.slice(64, 96)
+  var s = data.slice(96, 128)
+
+  var publicKey
+  try {
+    publicKey = utils.ecrecover(msgHash, v, r, s)
+  } catch (e) {
+    return results
+  }
+
+  results.return = utils.setLengthLeft(utils.publicToAddress(publicKey), 32)
+  results.exception = 1
+
+  return results
+}
+
+},{"../constants.js":51,"ethereum-common":70,"ethereumjs-util":47}],58:[function(require,module,exports){
+const utils = require('ethereumjs-util')
+const BN = utils.BN
+const error = require('../constants.js').ERROR
+const fees = require('ethereum-common')
+
+module.exports = function (opts) {
+  var results = {}
+  var data = opts.data
+
+  results.gasUsed = new BN(fees.sha256Gas.v)
+  results.gasUsed.iadd(new BN(fees.sha256WordGas.v).imuln(Math.ceil(data.length / 32)))
+
+  if (opts.gasLimit.cmp(results.gasUsed) === -1) {
+    results.gasUsed = opts.gasLimit
+    results.exceptionError = error.OUT_OF_GAS
+    results.exception = 0 // 0 means VM fail (in this case because of OOG)
+    return results
+  }
+
+  results.return = utils.sha256(data)
+  results.exception = 1
+
+  return results
+}
+
+},{"../constants.js":51,"ethereum-common":70,"ethereumjs-util":47}],59:[function(require,module,exports){
+const utils = require('ethereumjs-util')
+const BN = utils.BN
+const error = require('../constants.js').ERROR
+const fees = require('ethereum-common')
+
+module.exports = function (opts) {
+  var results = {}
+  var data = opts.data
+
+  results.gasUsed = new BN(fees.ripemd160Gas.v)
+  results.gasUsed.iadd(new BN(fees.ripemd160WordGas.v).imuln(Math.ceil(data.length / 32)))
+
+  if (opts.gasLimit.cmp(results.gasUsed) === -1) {
+    results.gasUsed = opts.gasLimit
+    results.exceptionError = error.OUT_OF_GAS
+    results.exception = 0 // 0 means VM fail (in this case because of OOG)
+    return results
+  }
+
+  results.return = utils.ripemd160(data, true)
+  results.exception = 1
+
+  return results
+}
+
+},{"../constants.js":51,"ethereum-common":70,"ethereumjs-util":47}],60:[function(require,module,exports){
+const utils = require('ethereumjs-util')
+const BN = utils.BN
+const fees = require('ethereum-common')
+const error = require('../constants.js').ERROR
+
+module.exports = function (opts) {
+  var results = {}
+  var data = opts.data
+
+  results.gasUsed = new BN(fees.identityGas.v)
+  results.gasUsed.iadd(new BN(fees.identityWordGas.v).imuln(Math.ceil(data.length / 32)))
+
+  if (opts.gasLimit.cmp(results.gasUsed) === -1) {
+    results.gasUsed = opts.gasLimit
+    results.exceptionError = error.OUT_OF_GAS
+    results.exception = 0 // 0 means VM fail (in this case because of OOG)
+    return results
+  }
+
+  results.return = data
+  results.exception = 1
+
+  return results
+}
+
+},{"../constants.js":51,"ethereum-common":70,"ethereumjs-util":47}],61:[function(require,module,exports){
+(function (Buffer){
+const async = require('async')
+const ethUtil = require('ethereumjs-util')
+const Bloom = require('./bloom.js')
+const common = require('ethereum-common')
+const rlp = ethUtil.rlp
+const Trie = require('merkle-patricia-tree')
+const BN = ethUtil.BN
+
+const minerReward = new BN(common.minerReward.v)
+const niblingReward = new BN(common.niblingReward.v)
+const ommerReward = new BN(common.ommerReward.v)
+
+/**
+ * process the transaction in a block and pays the miners
+ * @param opts
+ * @param opts.block {Block} the block we are processing
+ * @param opts.generate {Boolean} [gen=false] whether to generate the stateRoot
+ * @param cb {Function} the callback which is given an error string
+ */
+module.exports = function (opts, cb) {
+  const self = this
+
+  // parse options
+  const block = opts.block
+  const generateStateRoot = !!opts.generate
+  const validateStateRoot = !generateStateRoot
+  const bloom = new Bloom()
+  const receiptTrie = new Trie()
+  // the total amount of gas used processing this block
+  var gasUsed = new BN(0)
+  // miner account
+  var minerAccount
+  var receipts = []
+  var txResults = []
+  var result
+
+  if (opts.root) {
+    self.stateManager.trie.root = opts.root
+  }
+
+  this.trie.checkpoint()
+
+  // run everything
+  async.series([
+    beforeBlock,
+    populateCache,
+    processTransactions
+  ], parseBlockResults)
+
+  function beforeBlock (cb) {
+    self.emit('beforeBlock', opts.block, cb)
+  }
+
+  function afterBlock (cb) {
+    self.emit('afterBlock', result, cb)
+  }
+
+  // populates the cache with accounts that we know we will need
+  function populateCache (cb) {
+    var accounts = new Set()
+    accounts.add(block.header.coinbase.toString('hex'))
+    block.transactions.forEach(function (tx) {
+      accounts.add(tx.getSenderAddress().toString('hex'))
+      accounts.add(tx.to.toString('hex'))
+    })
+
+    block.uncleHeaders.forEach(function (uh) {
+      accounts.add(uh.coinbase.toString('hex'))
+    })
+
+    self.populateCache(accounts, cb)
+  }
+
+  /**
+   * Processes all of the transaction in the block
+   * @method processTransaction
+   * @param {Function} cb the callback is given error if there are any
+   */
+  function processTransactions (cb) {
+    var validReceiptCount = 0
+
+    async.eachSeries(block.transactions, processTx, cb)
+
+    function processTx (tx, cb) {
+      var gasLimitIsHigherThanBlock = new BN(block.header.gasLimit).cmp(new BN(tx.gasLimit).add(gasUsed)) === -1
+      if (gasLimitIsHigherThanBlock) {
+        cb('tx has a higher gas limit than the block')
+        return
+      }
+
+      // run the tx through the VM
+      self.runTx({
+        tx: tx,
+        block: block,
+        populateCache: false
+      }, parseTxResult)
+
+      function parseTxResult (err, result) {
+        txResults.push(result)
+
+        // abort if error
+        if (err) {
+          receipts.push(null)
+          cb(err)
+          return
+        }
+
+        gasUsed = gasUsed.add(result.gasUsed)
+        // combine blooms via bitwise OR
+        bloom.or(result.bloom)
+
+        if (generateStateRoot) {
+          block.header.bloom = bloom.bitvector
+        }
+
+        var txLogs = result.vm.logs || []
+        var rawTxReceipt = [
+          self.trie.root,
+          new Buffer(gasUsed.toArray()),
+          result.bloom.bitvector,
+          txLogs
+        ]
+        var txReceipt = {
+          stateRoot: rawTxReceipt[0],
+          gasUsed: rawTxReceipt[1],
+          bitvector: rawTxReceipt[2],
+          logs: rawTxReceipt[3]
+        }
+
+        receipts.push(txReceipt)
+        receiptTrie.put(rlp.encode(validReceiptCount), rlp.encode(rawTxReceipt))
+        validReceiptCount++
+        cb()
+      }
+    }
+  }
+
+  // handle results or error from block run
+  function parseBlockResults (err) {
+    if (err) {
+      self.trie.revert()
+      cb(err)
+      return
+    }
+
+    // credit all block rewards
+    payOmmersAndMiner()
+
+    // credit all block rewards
+    if (generateStateRoot) {
+      block.header.stateRoot = self.trie.root
+    }
+
+    self.trie.commit(function (err) {
+      self.stateManager.cache.flush(function () {
+        if (validateStateRoot) {
+          if (receiptTrie.root && receiptTrie.root.toString('hex') !== block.header.receiptTrie.toString('hex')) {
+            err = (err || '') + 'invalid receiptTrie '
+          }
+          if (bloom.bitvector.toString('hex') !== block.header.bloom.toString('hex')) {
+            err = (err || '') + 'invalid bloom '
+          }
+          if (ethUtil.bufferToInt(block.header.gasUsed) !== Number(gasUsed)) {
+            err = (err || '') + 'invalid gasUsed '
+          }
+          if (self.trie.root.toString('hex') !== block.header.stateRoot.toString('hex')) {
+            err = (err || '') + 'invalid block stateRoot '
+          }
+        }
+
+        self.stateManager.cache.clear()
+
+        result = {
+          receipts: receipts,
+          results: txResults,
+          error: err
+        }
+
+        afterBlock(cb.bind(this, err, result))
+      })
+    })
+  }
+
+  // credit all block rewards
+  function payOmmersAndMiner () {
+    var ommers = block.uncleHeaders
+    // pay each ommer
+    ommers.forEach(rewardOmmer)
+    // calculate nibling reward
+    var totalNiblingReward = niblingReward.mul(new BN(ommers.length))
+    minerAccount = self.stateManager.cache.get(block.header.coinbase)
+    // give miner the block reward
+    minerAccount.balance = new BN(minerAccount.balance)
+      .add(minerReward)
+      .add(totalNiblingReward)
+    self.stateManager.cache.put(block.header.coinbase, minerAccount)
+  }
+
+  // credit ommer
+  function rewardOmmer (ommer) {
+    // calculate reward
+    var heightDiff = new BN(block.header.number).sub(new BN(ommer.number))
+    var reward = minerReward.sub(ommerReward.mul(heightDiff))
+    // credit miners account
+    var ommerAccount = self.stateManager.cache.get(ommer.coinbase)
+    ommerAccount.balance = reward.add(new BN(ommerAccount.balance))
+    self.stateManager.cache.put(ommer.coinbase, ommerAccount)
+  }
+}
+
+}).call(this,require("buffer").Buffer)
+},{"./bloom.js":49,"async":10,"buffer":185,"ethereum-common":70,"ethereumjs-util":47,"merkle-patricia-tree":110}],62:[function(require,module,exports){
+const async = require('async')
+
+/**
+ * processes blocks and adds them to the blockchain
+ * @method onBlock
+ * @param blockchain
+ */
+module.exports = function (blockchain, cb) {
+  var self = this
+  var headBlock, parentState
+
+  // parse arguments
+  if (typeof blockchain === 'function') {
+    cb = blockchain
+  } else if (blockchain) {
+    self.blockchain = blockchain
+  }
+
+  // setup blockchain iterator
+  this.stateManager.blockchain.iterator('vm', processBlock, cb)
+  function processBlock (block, reorg, cb) {
+    async.series([
+      getStartingState,
+      runBlock
+    ], cb)
+
+    // determine starting state for block run
+    function getStartingState (cb) {
+      // if we are just starting or if a chain re-org has happened
+      if (!headBlock || reorg) {
+        self.stateManager.blockchain.getBlock(block.header.parentHash, function (err, parentBlock) {
+          parentState = parentBlock.header.stateRoot
+          // generate genesis state if we are at the genesis block
+          // we don't have the genesis state
+          if (!headBlock) {
+            return self.stateManager.generateCanonicalGenesis(cb)
+          } else {
+            cb(err)
+          }
+        })
+      } else {
+        parentState = headBlock.header.stateRoot
+        cb()
+      }
+    }
+
+    // run block, update head if valid
+    function runBlock (cb) {
+      self.runBlock({
+        block: block,
+        root: parentState
+      }, function (err, results) {
+        if (err) {
+          // remove invalid block
+          self.stateManager.blockchain.delBlock(block, cb)
+        } else {
+          // set as new head block
+          headBlock = block
+          cb()
+        }
+      })
+    }
+  }
+}
+
+},{"async":10}],63:[function(require,module,exports){
+(function (Buffer){
+const async = require('async')
+const ethUtil = require('ethereumjs-util')
+const BN = ethUtil.BN
+const fees = require('ethereum-common')
+const constants = require('./constants.js')
+
+const ERROR = constants.ERROR
+
+/**
+ * runs a CALL operation
+ * @method runCall
+ * @param opts
+ * @param opts.block {Block}
+ * @param opts.caller {Buffer}
+ * @param opts.code {Buffer} this is for CALLCODE where the code to load is different than the code from the to account.
+ * @param opts.data {Buffer}
+ * @param opts.gasLimit {Buffer | BN.js }
+ * @param opts.gasPrice {Buffer}
+ * @param opts.origin {Buffer} []
+ * @param opts.to {Buffer}
+ * @param opts.value {Buffer}
+ */
+module.exports = function (opts, cb) {
+  var self = this
+  var stateManager = self.stateManager
+
+  var vmResults = {}
+  var toAccount
+  var toAddress = opts.to
+  var createdAddress
+  var txValue = opts.value || new Buffer(0)
+  var caller = opts.caller
+  var account = stateManager.cache.get(caller)
+  var block = opts.block
+  var code = opts.code
+  var txData = opts.data
+  var gasLimit = opts.gasLimit || new BN(0xffffff)
+  gasLimit = new BN(opts.gasLimit) // make sure is a BN
+  var gasPrice = opts.gasPrice
+  var gasUsed = new BN(0)
+  var origin = opts.origin
+  var isCompiled = opts.compiled
+  var depth = opts.depth
+  var suicides = opts.suicides
+  var enableHomestead = this.opts.enableHomestead === undefined ? block.isHomestead() : this.opts.enableHomestead
+
+  txValue = new BN(txValue)
+
+  stateManager.checkpoint()
+
+  // run and parse
+  subTxValue()
+
+  async.series([
+    loadToAccount,
+    loadCode,
+    runCode,
+    saveCode
+  ], parseCallResult)
+
+  function loadToAccount (done) {
+    // get receiver's account
+    // toAccount = stateManager.cache.get(toAddress)
+    if (!toAddress) {
+      // generate a new contract if no `to`
+      code = txData
+      txData = undefined
+      var newNonce = new BN(account.nonce).subn(1)
+      createdAddress = toAddress = ethUtil.generateAddress(caller, newNonce.toArray())
+      stateManager.getAccount(createdAddress, function (err, account) {
+        toAccount = account
+        done(err)
+      })
+    } else {
+      // else load the `to` account
+      toAccount = stateManager.cache.get(toAddress)
+      done()
+    }
+  }
+
+  function subTxValue () {
+    account.balance = new BN(account.balance).sub(txValue)
+    stateManager.cache.put(caller, account)
+  }
+
+  function addTxValue () {
+    // add the amount sent to the `to` account
+    toAccount.balance = new BN(toAccount.balance).add(txValue)
+    stateManager.cache.put(toAddress, toAccount)
+  }
+
+  function loadCode (cb) {
+    addTxValue()
+    // loads the contract's code if the account is a contract
+    if (code || !(toAccount.isContract() || ethUtil.isPrecompiled(toAddress))) {
+      cb()
+      return
+    }
+
+    if (ethUtil.isPrecompiled(toAddress)) {
+      isCompiled = true
+      code = self._precompiled[toAddress.toString('hex')]
+      cb()
+      return
+    }
+
+    stateManager.getContractCode(toAddress, function (err, c, comp) {
+      if (err) return cb(err)
+      isCompiled = comp
+      code = c
+      cb()
+    })
+  }
+
+  function runCode (cb) {
+    if (!code) {
+      vmResults.exception = 1
+      stateManager.commit(cb)
+      return
+    }
+
+    var runCodeOpts = {
+      code: code,
+      data: txData,
+      gasLimit: gasLimit,
+      gasPrice: gasPrice,
+      address: toAddress,
+      origin: origin,
+      caller: caller,
+      value: new Buffer(txValue.toArray()),
+      block: block,
+      depth: depth,
+      suicides: suicides,
+      populateCache: false
+    }
+
+    // run Code through vm
+    var codeRunner = isCompiled ? self.runJIT : self.runCode
+    codeRunner.call(self, runCodeOpts, parseRunResult)
+
+    function parseRunResult (err, results) {
+      toAccount = self.stateManager.cache.get(toAddress)
+      vmResults = results
+
+      if (createdAddress) {
+        // fee for size of the return value
+        var returnFee = results.return.length * fees.createDataGas.v
+        var totalGas = results.gasUsed.addn(returnFee)
+        // if not enough gas
+        if (totalGas.cmp(gasLimit) <= 0) {
+          results.gasUsed = totalGas
+        } else {
+          results.return = new Buffer([])
+          if (enableHomestead) {
+            results.exception = 0
+            err = results.exceptionError = ERROR.OUT_OF_GAS
+            results.gasUsed = gasLimit
+          }
+        }
+      }
+
+      gasUsed = results.gasUsed
+      if (err) {
+        results.logs = []
+        stateManager.revert(cb)
+      } else {
+        stateManager.commit(cb)
+      }
+    }
+  }
+
+  function saveCode (cb) {
+    // store code for a new contract
+    if (createdAddress && vmResults.return.toString() !== '') {
+      stateManager.putContractCode(createdAddress, vmResults.return, cb)
+    } else {
+      cb()
+    }
+  }
+
+  function parseCallResult (err) {
+    if (err) return cb(err)
+    var results = {
+      gasUsed: gasUsed,
+      createdAddress: createdAddress,
+      vm: vmResults
+    }
+
+    cb(null, results)
+  }
+}
+
+}).call(this,require("buffer").Buffer)
+},{"./constants.js":51,"async":10,"buffer":185,"ethereum-common":70,"ethereumjs-util":47}],64:[function(require,module,exports){
+(function (Buffer){
+/*
+
+This is the core of the Ethereum Virtual Machine (EVM or just VM).
+
+NOTES:
+
+stack items are lazly dupilicated.
+So you must never directly change a buffer from the stack,
+instead you should `copy` it first
+
+not all stack items are 32 bytes, so if the operation realies on the stack
+item length then you must use utils.pad(<item>, 32) first.
+
+*/
+const async = require('async')
+const utils = require('ethereumjs-util')
+const Block = require('ethereumjs-block')
+const lookupOpInfo = require('./opcodes.js')
+const opFns = require('./opFns.js')
+const constants = require('./constants.js')
+const setImmediate = require('timers').setImmediate
+const BN = utils.BN
+
+const ERROR = constants.ERROR
+
+/**
+ * Runs EVM code
+ * @param opts
+ * @param opts.account {Account} the account that the exucuting code belongs to
+ * @param opts.address {Buffer}  the address of the account that is exucuting this code
+ * @param opts.block {Block} the block that the transaction is part of
+ * @param opts.caller {Buffer} the address that ran this code
+ * @param opts.code {Buffer} the code to be run
+ * @param opts.data {Buffer}  the input data
+ * @param opts.gasLimit {Buffer}
+ * @param opts.origin {Buffer} the address where the call originated from
+ * @param opts.value {Buffer} the amount the being transfered
+ * @param cb {Function}
+ */
+module.exports = function (opts, cb) {
+  var self = this
+  var stateManager = self.stateManager
+
+  var block = opts.block || new Block();
+
+  // VM internal state
+  var runState = {
+    stateManager: stateManager,
+    returnValue: false,
+    stopped: false,
+    vmError: false,
+    suicideTo: undefined,
+    programCounter: 0,
+    opCode: undefined,
+    opName: undefined,
+    gasLeft: new BN(opts.gasLimit),
+    gasLimit: new BN(opts.gasLimit),
+    gasPrice: opts.gasPrice,
+    memory: [],
+    memoryWordCount: 0,
+    stack: [],
+    logs: [],
+    validJumps: [],
+    gasRefund: new BN(0),
+    highestMemCost: new BN(0),
+    depth: opts.depth || 0,
+    suicides: opts.suicides || {},
+    block: block,
+    callValue: opts.value || new BN(0),
+    address: opts.address || utils.zeros(32),
+    caller: opts.caller || utils.zeros(32),
+    origin: opts.origin || opts.caller || utils.zeros(32),
+    callData: opts.data || new Buffer([0]),
+    code: opts.code,
+    populateCache: opts.populateCache === undefined ? true : opts.populateCache,
+    enableHomestead: this.opts.enableHomestead === undefined ? block.isHomestead() : this.opts.enableHomestead // this == vm
+  }
+
+  // temporary - to be factored out
+  runState._precompiled = self._precompiled
+  runState._vm = self
+
+  if (!runState.enableHomestead) {
+    delete opFns.DELEGATECALL
+  } else {
+    opFns.DELEGATECALL = opFns._DC
+  }
+
+  // prepare to run vm
+  preprocessValidJumps(runState)
+  // load contract then start vm run
+  loadContract(runVm)
+
+  // iterate through the given ops until something breaks or we hit STOP
+  function runVm () {
+    async.whilst(vmIsActive, iterateVm, parseVmResults)
+  }
+
+  // ensure contract is loaded; only used if runCode is called directly
+  function loadContract (cb) {
+    stateManager.getAccount(runState.address, function (err, account) {
+      if (err) return cb(err)
+      runState.contract = account
+      cb()
+    })
+  }
+
+  function vmIsActive () {
+    var notAtEnd = runState.programCounter < runState.code.length
+    return !runState.stopped && notAtEnd && !runState.vmError && !runState.returnValue
+  }
+
+  function iterateVm (done) {
+    if (runState.stack.length > 1024) {
+      return done(ERROR.INVALID_OPCODE)
+    }
+
+    var opCode = runState.code[runState.programCounter]
+    var opInfo = lookupOpInfo(opCode)
+    var opName = opInfo.name
+    var opFn = opFns[opName]
+
+    runState.opName = opName
+    runState.opCode = opCode
+
+    // check for invalid opcode
+    if (opName === 'INVALID') {
+      return done(ERROR.INVALID_OPCODE)
+    }
+
+    // check for stack underflows
+    if (runState.stack.length < opInfo.in) {
+      return done(ERROR.STACK_UNDERFLOW)
+    }
+
+    async.series([
+      runStepHook,
+      runOp
+    ], function (err) {
+      setImmediate(done.bind(null, err))
+    })
+
+    function runStepHook (cb) {
+      var eventObj = {
+        pc: runState.programCounter,
+        gasLeft: runState.gasLeft,
+        opcode: lookupOpInfo(opCode, true),
+        stack: runState.stack,
+        depth: runState.depth,
+        address: runState.address,
+        account: runState.contract,
+        cache: runState.stateManager.cache,
+        memory: runState.memory
+      }
+      self.emit('step', eventObj, cb)
+    }
+
+    function runOp (cb) {
+      // calculate gas
+      var fee = new BN(opInfo.fee)
+      // TODO: move to a shared funtion; subGas in opFuns
+      runState.gasLeft = runState.gasLeft.sub(fee)
+      if (runState.gasLeft.cmpn(0) === -1) {
+        runState.vmError = ERROR.OUT_OF_GAS
+        cb()
+        return
+      }
+      // advance program counter
+      runState.programCounter++
+      var argsNum = opInfo.in
+      // pop the stack
+      var args = argsNum ? runState.stack.splice(-opInfo.in) : []
+      args.reverse()
+      args.push(runState)
+      // create a callback for async opFunc
+      args.push(function (err, val) {
+        // save result to the stack
+        if (val) {
+          runState.stack.push(val)
+        }
+        cb(err)
+      })
+      try {
+        // run the opcode
+        var result = opFn.apply(null, args)
+      } catch (e) {
+        runState.vmError = e.error
+        cb()
+        return
+      }
+
+      // save result to the stack
+      if (result) {
+        runState.stack.push(result)
+      }
+      // call the callback if opFn was sync
+      if (opFn.length - argsNum !== 2) {
+        cb()
+      }
+    }
+  }
+
+  function parseVmResults (err) {
+    err = runState.vmError || err
+
+    // remove any logs on error
+    if (err) {
+      runState.logs = []
+      stateManager.revertContracts()
+    }
+
+    var results = {
+      suicides: runState.suicides,
+      suicideTo: runState.suicideTo,
+      gasRefund: runState.gasRefund,
+      exception: err ? 0 : 1,
+      exceptionError: err,
+      logs: runState.logs,
+      gas: runState.gasLeft,
+      'return': runState.returnValue ? runState.returnValue : new Buffer([])
+    }
+
+    if (results.exceptionError) {
+      delete results.gasRefund
+    }
+
+    if (err) {
+      results.gasUsed = runState.gasLimit
+    } else {
+      results.gasUsed = runState.gasLimit.sub(runState.gasLeft)
+    }
+
+    if (runState.populateCache) {
+      self.stateManager.cache.flush(function () {
+        self.stateManager.cache.clear()
+        cb(err, results)
+      })
+    } else {
+      cb(err, results)
+    }
+  }
+}
+
+// find all the valid jumps and puts them in the `validJumps` array
+function preprocessValidJumps (runState) {
+  for (var i = 0; i < runState.code.length; i++) {
+    var curOpCode = lookupOpInfo(runState.code[i]).name
+
+    // no destinations into the middle of PUSH
+    if (curOpCode === 'PUSH') {
+      i += runState.code[i] - 0x5f
+    }
+
+    if (curOpCode === 'JUMPDEST') {
+      runState.validJumps.push(i)
+    }
+  }
+}
+
+}).call(this,require("buffer").Buffer)
+},{"./constants.js":51,"./opFns.js":55,"./opcodes.js":56,"async":10,"buffer":185,"ethereumjs-block":41,"ethereumjs-util":47,"timers":272}],65:[function(require,module,exports){
+module.exports = function (opts, cb) {
+  // for precompiled
+  var results
+  if (typeof opts.code === 'function') {
+    results = opts.code(opts)
+    results.account = opts.account
+    if (results.exception === undefined) {
+      results.exception = 1
+    }
+    cb(results.exceptionError, results)
+  } else {
+    var f = new Function('require', 'opts', opts.code.toString()) // eslint-disable-line
+    results = f(require, opts)
+    results.account = opts.account
+    cb(results.exceptionError, results)
+  }
+}
+
+},{}],66:[function(require,module,exports){
+(function (Buffer){
+const async = require('async')
+const utils = require('ethereumjs-util')
+const BN = utils.BN
+const Bloom = require('./bloom.js')
+const Block = require('ethereumjs-block')
+
+/**
+ * Process a transaction. Run the vm. Transfers eth. checks balaces
+ * @method processTx
+ * @param opts
+ * @param opts.tx {Transaciton} - a transaction
+ * @param opts.skipNonce - skips the nonce check
+ * @param opts.skipBalance - skips the balance check
+ * @param opts.block {Block} needed to process the transaction, if no block is given a default one is created
+ * @param cb {Function} - the callback
+ */
+module.exports = function (opts, cb) {
+  var self = this
+  var block = opts.block
+  var tx = opts.tx
+  var gasLimit
+  var results
+  var basefee
+
+  // create a reasonable default if no block is given
+  if (!block) {
+    block = new Block()
+  }
+
+  if (new BN(block.header.gasLimit).cmp(new BN(tx.gasLimit)) === -1) {
+    cb(new Error('tx has a higher gas limit than the block'))
+    return
+  }
+
+  if (opts.populateCache === undefined) {
+    opts.populateCache = true
+  }
+
+  // run everything
+  async.series([
+    populateCache,
+    runTxHook,
+    runCall,
+    saveTries,
+    runAfterTxHook,
+    function (cb) {
+      self.stateManager.cache.flush(function () {
+        if (opts.populateCache) {
+          self.stateManager.cache.clear()
+        }
+        cb()
+      })
+    }
+  ], function (err) {
+    cb(err, results)
+  })
+
+  // run the transaction hook
+  function runTxHook (cb) {
+    self.emit('beforeTx', tx, cb)
+  }
+
+  // run the transaction hook
+  function runAfterTxHook (cb) {
+    self.emit('afterTx', results, cb)
+  }
+
+  /**
+   * populates the cache with the two and from of the tx
+   */
+  function populateCache (cb) {
+    var accounts = new Set()
+    accounts.add(tx.from.toString('hex'))
+    accounts.add(tx.to.toString('hex'))
+    accounts.add(block.header.coinbase.toString('hex'))
+
+    if (opts.populateCache === false) {
+      return cb()
+    }
+
+    self.stateManager.warmCache(accounts, cb)
+  }
+
+  // sets up the envorment and runs a `call`
+  function runCall (cb) {
+    // check to the sender's account to make sure it has enought wei and the
+    // correct nonce
+    var fromAccount = self.stateManager.cache.get(tx.from)
+    var message
+
+    if (!opts.skipBalance && new BN(fromAccount.balance).cmp(tx.getUpfrontCost()) === -1) {
+      message = "sender doesn't have enough funds to send tx. The upfront cost is: " + tx.getUpfrontCost().toString() + ' and the sender\s account only has: ' + new BN(fromAccount.balance).toString()
+      cb(new Error(message))
+      return
+    } else if (!opts.skipNonce && new BN(fromAccount.nonce).cmp(new BN(tx.nonce)) !== 0) {
+      message = "the tx doesn't have the correct nonce. account has nonce of: " + new BN(fromAccount.nonce).toString() + ' tx has nonce of: ' + new BN(tx.nonce).toString()
+      cb(new Error(message))
+      return
+    }
+
+    // increment the nonce
+    fromAccount.nonce = new BN(fromAccount.nonce).addn(1)
+    basefee = tx.getBaseFee()
+    gasLimit = new BN(tx.gasLimit).sub(basefee)
+    fromAccount.balance = new BN(fromAccount.balance).sub(new BN(tx.gasLimit).mul(new BN(tx.gasPrice)))
+    self.stateManager.cache.put(tx.from, fromAccount)
+
+    var options = {
+      caller: tx.from,
+      gasLimit: gasLimit,
+      gasPrice: tx.gasPrice,
+      to: tx.to,
+      value: tx.value,
+      data: tx.data,
+      block: block,
+      populateCache: false,
+    }
+
+    if (opts.enableHomestead === true) {
+      options.enableHomestead = true
+    }
+
+    if (tx.to.toString('hex') === '') {
+      delete options.to
+    }
+
+    // run call
+    self.runCall(options, parseResults)
+
+    function parseResults (err, _results) {
+      if (err) return cb(err)
+      results = _results
+
+      // generate the bloom for the tx
+      results.bloom = txLogsBloom(results.vm.logs)
+      fromAccount = self.stateManager.cache.get(tx.from)
+
+      // caculate the totall gas used
+      results.gasUsed = results.gasUsed.add(basefee)
+
+      // refund the accoun.stateManagert
+      var gasRefund = results.vm.gasRefund
+      if (gasRefund) {
+        if (gasRefund.cmp(results.gasUsed.divn(2)) === -1) {
+          results.gasUsed.isub(gasRefund)
+        } else {
+          results.gasUsed.isub(results.gasUsed.divn(2))
+        }
+      }
+
+      results.amountSpent = results.gasUsed.mul(new BN(tx.gasPrice))
+      // refund the left over gas amount
+      fromAccount.balance = new BN(tx.gasLimit).sub(results.gasUsed)
+        .mul(new BN(tx.gasPrice))
+        .add(new BN(fromAccount.balance))
+
+      self.stateManager.cache.put(tx.from, fromAccount)
+
+      var minerAccount = self.stateManager.cache.get(block.header.coinbase)
+      // add the amount spent on gas to the miner's account
+      minerAccount.balance = new BN(minerAccount.balance)
+        .add(results.amountSpent)
+
+      // save the miner's account
+      self.stateManager.cache.put(block.header.coinbase, minerAccount)
+
+      if (!results.vm.suicides) {
+        results.vm.suicides = {}
+      }
+
+      var keys = Object.keys(results.vm.suicides)
+
+      keys.forEach(function (s) {
+        self.stateManager.cache.del(new Buffer(s, 'hex'))
+      })
+
+      cb()
+    }
+  }
+
+  function saveTries (cb) {
+    self.stateManager.commitContracts(cb)
+  }
+}
+
+/**
+ * @method txLogsBloom
+ */
+function txLogsBloom (logs) {
+  var bloom = new Bloom()
+  if (logs) {
+    for (var i = 0; i < logs.length; i++) {
+      var log = logs[i]
+      // add the address
+      bloom.add(log[0])
+      // add the topics
+      var topics = log[1]
+      for (var q = 0; q < topics.length; q++) {
+        bloom.add(topics[q])
+      }
+    }
+  }
+  return bloom
+}
+
+}).call(this,require("buffer").Buffer)
+},{"./bloom.js":49,"async":10,"buffer":185,"ethereumjs-block":41,"ethereumjs-util":47}],67:[function(require,module,exports){
+(function (Buffer){
+const Trie = require('merkle-patricia-tree/secure.js')
+const common = require('ethereum-common')
+const async = require('async')
+const Account = require('ethereumjs-account')
+const fakeBlockchain = require('./fakeBlockChain.js')
+const Cache = require('./cache.js')
+const utils = require('ethereumjs-util')
+const BN = utils.BN
+const rlp = utils.rlp
+
+module.exports = StateManager
+
+function StateManager (opts) {
+  var self = this
+
+  var trie = opts.trie
+  if (!trie) {
+    trie = new Trie(trie)
+  }
+
+  var blockchain = opts.blockchain
+  if (!blockchain) {
+    blockchain = fakeBlockchain
+  }
+
+  self.blockchain = blockchain
+  self.trie = trie
+  self._storageTries = {} // the storage trie cache
+  self.cache = new Cache(trie)
+}
+
+var proto = StateManager.prototype
+
+// gets the account from the cache, or triggers a lookup and stores
+// the result in the cache
+proto.getAccount = function (address, cb) {
+  this.cache.getOrLoad(address, cb)
+}
+
+// checks if an account exists
+proto.exists = function (address, cb) {
+  this.cache.getOrLoad(address, function (err, account) {
+    cb(err, account.exists)
+  })
+}
+
+// saves the account
+proto._putAccount = function (address, account, cb) {
+  var self = this
+  var addressHex = new Buffer(address, 'hex')
+  // TODO: dont save newly created accounts that have no balance
+  // if (toAccount.balance.toString('hex') === '00') {
+  // if they have money or a non-zero nonce or code, then write to tree
+  self.cache.put(addressHex, account)
+  // self.trie.put(addressHex, account.serialize(), cb)
+  cb()
+}
+
+proto.getAccountBalance = function (address, cb) {
+  var self = this
+  self.getAccount(address, function (err, account) {
+    if (err) return cb(err)
+    cb(null, account.balance)
+  })
+}
+
+proto.putAccountBalance = function (address, balance, cb) {
+  var self = this
+  self.getAccount(address, function (err, account) {
+    if (err) {
+      cb(err)
+    }
+    account.balance = balance
+    self._putAccount(address, account, cb)
+  })
+}
+
+// sets the contract code on the account
+proto.putContractCode = function (address, value, cb) {
+  var self = this
+  self.getAccount(address, function (err, account) {
+    if (err) {
+      cb(err)
+    }
+    // TODO: setCode use trie.setRaw which creates a storage leak
+    account.setCode(self.trie, value, function (err) {
+      if (err) return cb(err)
+      self._putAccount(address, account, cb)
+    })
+  })
+}
+
+// given an account object, returns the code
+proto.getContractCode = function (address, cb) {
+  var self = this
+  self.getAccount(address, function (err, account) {
+    if (err) return cb(err)
+    account.getCode(self.trie, cb)
+  })
+}
+
+// creates a storage trie from the primary storage trie
+proto._lookupStorageTrie = function (address, cb) {
+  var self = this
+  // from state trie
+  self.getAccount(address, function (err, account) {
+    if (err) return cb(err)
+    var storageTrie = self.trie.copy()
+    storageTrie.root = account.stateRoot
+    storageTrie._checkpoints = []
+    cb(null, storageTrie)
+  })
+}
+
+// gets the storage trie from the storage cache or does lookup
+proto._getStorageTrie = function (address, cb) {
+  var self = this
+  var storageTrie = self._storageTries[address.toString('hex')]
+  // from storage cache
+  if (storageTrie) {
+    cb(null, storageTrie)
+    return
+  }
+  // lookup from state
+  self._lookupStorageTrie(address, cb)
+}
+
+proto.getContractStorage = function (address, key, cb) {
+  var self = this
+  self._getStorageTrie(address, function (err, trie) {
+    if (err) return cb(err)
+    trie.get(key, function (err, value) {
+      if (err) return cb(err)
+      var decoded = rlp.decode(value)
+      cb(null, decoded)
+    })
+  })
+}
+
+proto.putContractStorage = function (address, key, value, cb) {
+  var self = this
+  self._getStorageTrie(address, function (err, storageTrie) {
+    if (err) return cb(err)
+
+    if (value && value.length) {
+      // format input
+      var encodedValue = rlp.encode(value)
+      storageTrie.put(key, encodedValue, finalize)
+    } else {
+      // deleting a value
+      storageTrie.del(key, finalize)
+    }
+
+    function finalize (err) {
+      if (err) return cb(err)
+      // update storage cache
+      self._storageTries[address.toString('hex')] = storageTrie
+      // update contract stateRoot
+      var contract = self.cache.get(address)
+      contract.stateRoot = storageTrie.root
+      self._putAccount(address, contract, cb)
+    }
+  })
+}
+
+proto.commitContracts = function (cb) {
+  var self = this
+  async.each(Object.keys(self._storageTries), function (address, cb) {
+    var trie = self._storageTries[address]
+    delete self._storageTries[address]
+    // TODO: this is broken on the block level; all the contracts get written to
+    // disk redardless of whether or not the block is valid
+    if (trie.isCheckpoint) {
+      trie.commit(cb)
+    } else {
+      cb()
+    }
+  }, cb)
+}
+
+proto.revertContracts = function () {
+  var self = this
+  self._storageTries = {}
+}
+
+//
+// blockchain
+//
+proto.getBlockHash = function (number, cb) {
+  var self = this
+  self.blockchain.getBlock(number, function (err, block) {
+    if (err) return cb(err)
+    var blockHash = block.hash()
+    cb(null, blockHash)
+  })
+}
+
+//
+// revision history
+//
+proto.checkpoint = function () {
+  var self = this
+  self.trie.checkpoint()
+  self.cache.checkpoint()
+}
+
+proto.commit = function (cb) {
+  var self = this
+  // setup trie checkpointing
+  self.trie.commit(function () {
+    // setup cache checkpointing
+    self.cache.commit()
+    cb()
+  })
+}
+
+proto.revert = function (cb) {
+  var self = this
+  // setup trie checkpointing
+  self.trie.revert()
+  // setup cache checkpointing
+  self.cache.revert()
+  cb()
+}
+
+//
+// cache stuff
+//
+proto.getStateRoot = function (cb) {
+  var self = this
+  self.cacheFlush(function (err) {
+    if (err) return cb(err)
+    var stateRoot = self.trie.root
+    cb(null, stateRoot)
+  })
+}
+
+/**
+ * @param {Set} address
+ * @param {cb} function
+ */
+proto.warmCache = function (addresses, cb) {
+  this.cache.warm(addresses, cb)
+}
+
+proto.dumpStorage = function (address, cb) {
+  var self = this
+  self._getStorageTrie(address, function (err, trie) {
+    if (err) {
+      cb(err)
+    }
+    var storage = {}
+    var stream = trie.createReadStream()
+    stream.on('data', function (val) {
+      storage[val.key.toString('hex')] = val.value.toString('hex')
+    })
+    stream.on('end', function () {
+      cb(storage)
+    })
+  })
+}
+
+proto.hasGenesisState = function (cb) {
+  const root = common.genesisStateRoot.v
+  this.trie.checkRoot(root, cb)
+}
+
+proto.generateCanonicalGenesis = function (cb) {
+  var self = this
+
+  this.hasGenesisState(function (err, genesis) {
+    if (!genesis & !err) {
+      self.generateGenesis(common.genesisState, cb)
+    } else {
+      cb(err)
+    }
+  })
+}
+
+proto.generateGenesis = function (initState, cb) {
+  var self = this
+  var addresses = Object.keys(initState)
+  async.eachSeries(addresses, function (address, done) {
+    var account = new Account()
+    account.balance = new Buffer((new BN(initState[address])).toArray())
+    address = new Buffer(address, 'hex')
+    self.trie.put(address, account.serialize(), done)
+  }, cb)
+}
+
+}).call(this,require("buffer").Buffer)
+},{"./cache.js":50,"./fakeBlockChain.js":52,"async":10,"buffer":185,"ethereum-common":70,"ethereumjs-account":39,"ethereumjs-util":47,"merkle-patricia-tree/secure.js":113}],68:[function(require,module,exports){
+arguments[4][42][0].apply(exports,arguments)
+},{"dup":42}],69:[function(require,module,exports){
+arguments[4][43][0].apply(exports,arguments)
+},{"dup":43}],70:[function(require,module,exports){
+arguments[4][44][0].apply(exports,arguments)
+},{"./bootstrapNodes.json":68,"./genesisState.json":69,"./params.json":71,"dup":44}],71:[function(require,module,exports){
+arguments[4][37][0].apply(exports,arguments)
+},{"dup":37}],72:[function(require,module,exports){
 "use strict"
 
 module.exports = createRBTree
@@ -25628,7 +25662,7 @@ function defaultCompare(a, b) {
 function createRBTree(compare) {
   return new RedBlackTree(compare || defaultCompare, null)
 }
-},{}],68:[function(require,module,exports){
+},{}],73:[function(require,module,exports){
 var hash = exports;
 
 hash.utils = require('./hash/utils');
@@ -25645,7 +25679,7 @@ hash.sha384 = hash.sha.sha384;
 hash.sha512 = hash.sha.sha512;
 hash.ripemd160 = hash.ripemd.ripemd160;
 
-},{"./hash/common":69,"./hash/hmac":70,"./hash/ripemd":71,"./hash/sha":72,"./hash/utils":73}],69:[function(require,module,exports){
+},{"./hash/common":74,"./hash/hmac":75,"./hash/ripemd":76,"./hash/sha":77,"./hash/utils":78}],74:[function(require,module,exports){
 var hash = require('../hash');
 var utils = hash.utils;
 var assert = utils.assert;
@@ -25738,7 +25772,7 @@ BlockHash.prototype._pad = function pad() {
   return res;
 };
 
-},{"../hash":68}],70:[function(require,module,exports){
+},{"../hash":73}],75:[function(require,module,exports){
 var hmac = exports;
 
 var hash = require('../hash');
@@ -25788,7 +25822,7 @@ Hmac.prototype.digest = function digest(enc) {
   return this.outer.digest(enc);
 };
 
-},{"../hash":68}],71:[function(require,module,exports){
+},{"../hash":73}],76:[function(require,module,exports){
 var hash = require('../hash');
 var utils = hash.utils;
 
@@ -25934,7 +25968,7 @@ var sh = [
   8, 5, 12, 9, 12, 5, 14, 6, 8, 13, 6, 5, 15, 13, 11, 11
 ];
 
-},{"../hash":68}],72:[function(require,module,exports){
+},{"../hash":73}],77:[function(require,module,exports){
 var hash = require('../hash');
 var utils = hash.utils;
 var assert = utils.assert;
@@ -26500,7 +26534,7 @@ function g1_512_lo(xh, xl) {
   return r;
 }
 
-},{"../hash":68}],73:[function(require,module,exports){
+},{"../hash":73}],78:[function(require,module,exports){
 var utils = exports;
 var inherits = require('inherits');
 
@@ -26759,7 +26793,7 @@ function shr64_lo(ah, al, num) {
 };
 exports.shr64_lo = shr64_lo;
 
-},{"inherits":74}],74:[function(require,module,exports){
+},{"inherits":79}],79:[function(require,module,exports){
 if (typeof Object.create === 'function') {
   // implementation from standard node.js 'util' module
   module.exports = function inherits(ctor, superCtor) {
@@ -26784,12 +26818,12 @@ if (typeof Object.create === 'function') {
   }
 }
 
-},{}],75:[function(require,module,exports){
+},{}],80:[function(require,module,exports){
 module.exports = Array.isArray || function (arr) {
   return Object.prototype.toString.call(arr) == '[object Array]';
 };
 
-},{}],76:[function(require,module,exports){
+},{}],81:[function(require,module,exports){
 (function (global){
 /*
  * js-sha3 v0.3.1
@@ -27225,10 +27259,10 @@ module.exports = Array.isArray || function (arr) {
 }(this));
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],77:[function(require,module,exports){
+},{}],82:[function(require,module,exports){
 module.exports = require('sha3').SHA3Hash
 
-},{"sha3":33}],78:[function(require,module,exports){
+},{"sha3":13}],83:[function(require,module,exports){
 var encodings = require('./lib/encodings');
 
 module.exports = Codec;
@@ -27336,7 +27370,7 @@ Codec.prototype.valueAsBuffer = function(opts){
 };
 
 
-},{"./lib/encodings":79}],79:[function(require,module,exports){
+},{"./lib/encodings":84}],84:[function(require,module,exports){
 (function (Buffer){
 
 exports.utf8 = exports['utf-8'] = {
@@ -27416,7 +27450,7 @@ function isBinary(data){
 
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179}],80:[function(require,module,exports){
+},{"buffer":185}],85:[function(require,module,exports){
 /* Copyright (c) 2012-2015 LevelUP contributors
  * See list at <https://github.com/rvagg/node-levelup#contributing>
  * MIT License
@@ -27440,7 +27474,7 @@ module.exports = {
   , EncodingError       : createError('EncodingError', LevelUPError)
 }
 
-},{"errno":55}],81:[function(require,module,exports){
+},{"errno":35}],86:[function(require,module,exports){
 var inherits = require('inherits');
 var Readable = require('readable-stream').Readable;
 var extend = require('xtend');
@@ -27498,7 +27532,7 @@ ReadStream.prototype._cleanup = function(){
 };
 
 
-},{"inherits":74,"level-errors":80,"readable-stream":87,"xtend":88}],82:[function(require,module,exports){
+},{"inherits":79,"level-errors":85,"readable-stream":92,"xtend":93}],87:[function(require,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -27591,7 +27625,7 @@ function forEach (xs, f) {
 }
 
 }).call(this,require('_process'))
-},{"./_stream_readable":84,"./_stream_writable":86,"_process":237,"core-util-is":34,"inherits":74}],83:[function(require,module,exports){
+},{"./_stream_readable":89,"./_stream_writable":91,"_process":243,"core-util-is":14,"inherits":79}],88:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -27639,7 +27673,7 @@ PassThrough.prototype._transform = function(chunk, encoding, cb) {
   cb(null, chunk);
 };
 
-},{"./_stream_transform":85,"core-util-is":34,"inherits":74}],84:[function(require,module,exports){
+},{"./_stream_transform":90,"core-util-is":14,"inherits":79}],89:[function(require,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -28594,7 +28628,7 @@ function indexOf (xs, x) {
 }
 
 }).call(this,require('_process'))
-},{"./_stream_duplex":82,"_process":237,"buffer":179,"core-util-is":34,"events":216,"inherits":74,"isarray":75,"stream":264,"string_decoder/":131,"util":153}],85:[function(require,module,exports){
+},{"./_stream_duplex":87,"_process":243,"buffer":185,"core-util-is":14,"events":222,"inherits":79,"isarray":80,"stream":270,"string_decoder/":136,"util":159}],90:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -28805,7 +28839,7 @@ function done(stream, er) {
   return stream.push(null);
 }
 
-},{"./_stream_duplex":82,"core-util-is":34,"inherits":74}],86:[function(require,module,exports){
+},{"./_stream_duplex":87,"core-util-is":14,"inherits":79}],91:[function(require,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -29286,7 +29320,7 @@ function endWritable(stream, state, cb) {
 }
 
 }).call(this,require('_process'))
-},{"./_stream_duplex":82,"_process":237,"buffer":179,"core-util-is":34,"inherits":74,"stream":264}],87:[function(require,module,exports){
+},{"./_stream_duplex":87,"_process":243,"buffer":185,"core-util-is":14,"inherits":79,"stream":270}],92:[function(require,module,exports){
 exports = module.exports = require('./lib/_stream_readable.js');
 exports.Stream = require('stream');
 exports.Readable = exports;
@@ -29295,9 +29329,9 @@ exports.Duplex = require('./lib/_stream_duplex.js');
 exports.Transform = require('./lib/_stream_transform.js');
 exports.PassThrough = require('./lib/_stream_passthrough.js');
 
-},{"./lib/_stream_duplex.js":82,"./lib/_stream_passthrough.js":83,"./lib/_stream_readable.js":84,"./lib/_stream_transform.js":85,"./lib/_stream_writable.js":86,"stream":264}],88:[function(require,module,exports){
-arguments[4][26][0].apply(exports,arguments)
-},{"dup":26}],89:[function(require,module,exports){
+},{"./lib/_stream_duplex.js":87,"./lib/_stream_passthrough.js":88,"./lib/_stream_readable.js":89,"./lib/_stream_transform.js":90,"./lib/_stream_writable.js":91,"stream":270}],93:[function(require,module,exports){
+arguments[4][6][0].apply(exports,arguments)
+},{"dup":6}],94:[function(require,module,exports){
 (function (process){
 /* Copyright (c) 2013 LevelUP contributors
  * See list at <https://github.com/rvagg/node-levelup#contributing>
@@ -29454,11 +29488,11 @@ module.exports = function (db) {
 
 module.exports.WriteStream = WriteStream
 }).call(this,require('_process'))
-},{"_process":237,"readable-stream":95,"stream":264,"util":269,"xtend":134}],90:[function(require,module,exports){
-arguments[4][82][0].apply(exports,arguments)
-},{"./_stream_readable":92,"./_stream_writable":94,"_process":237,"core-util-is":34,"dup":82,"inherits":74}],91:[function(require,module,exports){
-arguments[4][83][0].apply(exports,arguments)
-},{"./_stream_transform":93,"core-util-is":34,"dup":83,"inherits":74}],92:[function(require,module,exports){
+},{"_process":243,"readable-stream":100,"stream":270,"util":275,"xtend":139}],95:[function(require,module,exports){
+arguments[4][87][0].apply(exports,arguments)
+},{"./_stream_readable":97,"./_stream_writable":99,"_process":243,"core-util-is":14,"dup":87,"inherits":79}],96:[function(require,module,exports){
+arguments[4][88][0].apply(exports,arguments)
+},{"./_stream_transform":98,"core-util-is":14,"dup":88,"inherits":79}],97:[function(require,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -30444,7 +30478,7 @@ function indexOf (xs, x) {
 }
 
 }).call(this,require('_process'))
-},{"_process":237,"buffer":179,"core-util-is":34,"events":216,"inherits":74,"isarray":75,"stream":264,"string_decoder/":131}],93:[function(require,module,exports){
+},{"_process":243,"buffer":185,"core-util-is":14,"events":222,"inherits":79,"isarray":80,"stream":270,"string_decoder/":136}],98:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -30656,7 +30690,7 @@ function done(stream, er) {
   return stream.push(null);
 }
 
-},{"./_stream_duplex":90,"core-util-is":34,"inherits":74}],94:[function(require,module,exports){
+},{"./_stream_duplex":95,"core-util-is":14,"inherits":79}],99:[function(require,module,exports){
 (function (process){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -31046,7 +31080,7 @@ function endWritable(stream, state, cb) {
 }
 
 }).call(this,require('_process'))
-},{"./_stream_duplex":90,"_process":237,"buffer":179,"core-util-is":34,"inherits":74,"stream":264}],95:[function(require,module,exports){
+},{"./_stream_duplex":95,"_process":243,"buffer":185,"core-util-is":14,"inherits":79,"stream":270}],100:[function(require,module,exports){
 var Stream = require('stream'); // hack to fix a circular dependency issue when used with browserify
 exports = module.exports = require('./lib/_stream_readable.js');
 exports.Stream = Stream;
@@ -31056,7 +31090,7 @@ exports.Duplex = require('./lib/_stream_duplex.js');
 exports.Transform = require('./lib/_stream_transform.js');
 exports.PassThrough = require('./lib/_stream_passthrough.js');
 
-},{"./lib/_stream_duplex.js":90,"./lib/_stream_passthrough.js":91,"./lib/_stream_readable.js":92,"./lib/_stream_transform.js":93,"./lib/_stream_writable.js":94,"stream":264}],96:[function(require,module,exports){
+},{"./lib/_stream_duplex.js":95,"./lib/_stream_passthrough.js":96,"./lib/_stream_readable.js":97,"./lib/_stream_transform.js":98,"./lib/_stream_writable.js":99,"stream":270}],101:[function(require,module,exports){
 /* Copyright (c) 2012-2015 LevelUP contributors
  * See list at <https://github.com/level/levelup#contributing>
  * MIT License
@@ -31141,7 +31175,7 @@ Batch.prototype.write = function (callback) {
 
 module.exports = Batch
 
-},{"./util":98,"level-errors":80}],97:[function(require,module,exports){
+},{"./util":103,"level-errors":85}],102:[function(require,module,exports){
 (function (process){
 /* Copyright (c) 2012-2015 LevelUP contributors
  * See list at <https://github.com/level/levelup#contributing>
@@ -31544,7 +31578,7 @@ module.exports.repair  = deprecate(
 
 
 }).call(this,require('_process'))
-},{"./batch":96,"./util":98,"_process":237,"deferred-leveldown":36,"events":216,"level-codec":78,"level-errors":80,"level-iterator-stream":81,"prr":116,"util":269,"xtend":99}],98:[function(require,module,exports){
+},{"./batch":101,"./util":103,"_process":243,"deferred-leveldown":16,"events":222,"level-codec":83,"level-errors":85,"level-iterator-stream":86,"prr":121,"util":275,"xtend":104}],103:[function(require,module,exports){
 /* Copyright (c) 2012-2015 LevelUP contributors
  * See list at <https://github.com/level/levelup#contributing>
  * MIT License
@@ -31623,14 +31657,14 @@ module.exports = {
   , isDefined       : isDefined
 }
 
-},{"../package.json":100,"level-errors":80,"leveldown":153,"leveldown/package":153,"semver":153,"util":269,"xtend":99}],99:[function(require,module,exports){
-arguments[4][26][0].apply(exports,arguments)
-},{"dup":26}],100:[function(require,module,exports){
+},{"../package.json":105,"level-errors":85,"leveldown":159,"leveldown/package":159,"semver":159,"util":275,"xtend":104}],104:[function(require,module,exports){
+arguments[4][6][0].apply(exports,arguments)
+},{"dup":6}],105:[function(require,module,exports){
 module.exports={
   "_args": [
     [
       "levelup@^1.2.1",
-      "/Users/alex/Projects/ethereumjs/ethereumjs-vm/node_modules/merkle-patricia-tree"
+      "/Users/alex/Projects/ethereumjs/browser-builds/node_modules/merkle-patricia-tree"
     ]
   ],
   "_from": "levelup@>=1.2.1 <2.0.0",
@@ -31654,16 +31688,13 @@ module.exports={
     "type": "range"
   },
   "_requiredBy": [
-    "#DEV:/",
-    "/ethereumjs-blockchain",
-    "/level-packager",
     "/merkle-patricia-tree"
   ],
   "_resolved": "https://registry.npmjs.org/levelup/-/levelup-1.3.1.tgz",
   "_shasum": "8030758bb1b1dafdb71bfb55fff0caa2740cb846",
   "_shrinkwrap": null,
   "_spec": "levelup@^1.2.1",
-  "_where": "/Users/alex/Projects/ethereumjs/ethereumjs-vm/node_modules/merkle-patricia-tree",
+  "_where": "/Users/alex/Projects/ethereumjs/browser-builds/node_modules/merkle-patricia-tree",
   "browser": {
     "leveldown": false,
     "leveldown/package": false,
@@ -31813,7 +31844,7 @@ module.exports={
   "version": "1.3.1"
 }
 
-},{}],101:[function(require,module,exports){
+},{}],106:[function(require,module,exports){
 (function (Buffer){
 
 exports.compare = function (a, b) {
@@ -31912,7 +31943,7 @@ exports.filter = function (range, compare) {
 }
 
 }).call(this,{"isBuffer":require("../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js")})
-},{"../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js":227}],102:[function(require,module,exports){
+},{"../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js":233}],107:[function(require,module,exports){
 (function (process,global,Buffer){
 var inherits          = require('inherits')
   , AbstractLevelDOWN = require('abstract-leveldown').AbstractLevelDOWN
@@ -32156,7 +32187,7 @@ MemDOWN.destroy = function (name, callback) {
 module.exports = MemDOWN
 
 }).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {},require("buffer").Buffer)
-},{"_process":237,"abstract-leveldown":24,"buffer":179,"functional-red-black-tree":67,"inherits":74,"ltgt":101}],103:[function(require,module,exports){
+},{"_process":243,"abstract-leveldown":4,"buffer":185,"functional-red-black-tree":72,"inherits":79,"ltgt":106}],108:[function(require,module,exports){
 const assert = require('assert')
 const levelup = require('levelup')
 const memdown = require('memdown')
@@ -32892,7 +32923,7 @@ Trie.prototype.checkRoot = function (root, cb) {
   })
 }
 
-},{"./readStream":106,"./trieNode":109,"./util":110,"assert":149,"async":30,"ethereumjs-util":66,"levelup":97,"memdown":102,"rlp":124,"semaphore":130}],104:[function(require,module,exports){
+},{"./readStream":111,"./trieNode":114,"./util":115,"assert":155,"async":10,"ethereumjs-util":47,"levelup":102,"memdown":107,"rlp":129,"semaphore":135}],109:[function(require,module,exports){
 const levelup = require('levelup')
 const memdown = require('memdown')
 const async = require('async')
@@ -33079,7 +33110,7 @@ ScratchReadStream.prototype._read = function () {
   }
 }
 
-},{"./util":110,"async":30,"level-ws":89,"levelup":97,"memdown":102,"readable-stream":123,"util":269}],105:[function(require,module,exports){
+},{"./util":115,"async":10,"level-ws":94,"levelup":102,"memdown":107,"readable-stream":128,"util":275}],110:[function(require,module,exports){
 const BaseTrie = require('./baseTrie')
 const checkpointInterface = require('./checkpoint-interface')
 const inherits = require('util').inherits
@@ -33093,7 +33124,7 @@ function CheckpointTrie () {
   checkpointInterface(this)
 }
 
-},{"./baseTrie":103,"./checkpoint-interface":104,"util":269}],106:[function(require,module,exports){
+},{"./baseTrie":108,"./checkpoint-interface":109,"util":275}],111:[function(require,module,exports){
 const Readable = require('readable-stream').Readable
 const TrieNode = require('./trieNode')
 const util = require('util')
@@ -33127,7 +33158,7 @@ TrieReadStream.prototype._read = function () {
   }
 }
 
-},{"./trieNode":109,"readable-stream":123,"util":269}],107:[function(require,module,exports){
+},{"./trieNode":114,"readable-stream":128,"util":275}],112:[function(require,module,exports){
 const ethUtil = require('ethereumjs-util')
 
 module.exports = secureInterface
@@ -33168,7 +33199,7 @@ function del (_super, key, cb) {
   _super(hash, cb)
 }
 
-},{"ethereumjs-util":66}],108:[function(require,module,exports){
+},{"ethereumjs-util":47}],113:[function(require,module,exports){
 const CheckpointTrie = require('./index')
 const secureInterface = require('./secure-interface')
 const inherits = require('util').inherits
@@ -33186,7 +33217,7 @@ function SecureTrie () {
   secureInterface(this)
 }
 
-},{"./index":105,"./secure-interface":107,"util":269}],109:[function(require,module,exports){
+},{"./index":110,"./secure-interface":112,"util":275}],114:[function(require,module,exports){
 (function (Buffer){
 const rlp = require('rlp')
 const ethUtil = require('ethereumjs-util')
@@ -33445,7 +33476,7 @@ function isRawNode (node) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179,"ethereumjs-util":66,"rlp":124}],110:[function(require,module,exports){
+},{"buffer":185,"ethereumjs-util":47,"rlp":129}],115:[function(require,module,exports){
 (function (process){
 const async = require('async')
 
@@ -33527,7 +33558,7 @@ function asyncFirstSeries (array, iterator, cb) {
 }
 
 }).call(this,require('_process'))
-},{"_process":237,"async":30}],111:[function(require,module,exports){
+},{"_process":243,"async":10}],116:[function(require,module,exports){
 var hasOwn = Object.prototype.hasOwnProperty;
 var toString = Object.prototype.toString;
 
@@ -33569,11 +33600,11 @@ module.exports = function forEach(obj, fn) {
 };
 
 
-},{}],112:[function(require,module,exports){
+},{}],117:[function(require,module,exports){
 module.exports = Object.keys || require('./shim');
 
 
-},{"./shim":114}],113:[function(require,module,exports){
+},{"./shim":119}],118:[function(require,module,exports){
 var toString = Object.prototype.toString;
 
 module.exports = function isArguments(value) {
@@ -33591,7 +33622,7 @@ module.exports = function isArguments(value) {
 };
 
 
-},{}],114:[function(require,module,exports){
+},{}],119:[function(require,module,exports){
 (function () {
 	"use strict";
 
@@ -33655,7 +33686,7 @@ module.exports = function isArguments(value) {
 }());
 
 
-},{"./foreach":111,"./isArguments":113}],115:[function(require,module,exports){
+},{"./foreach":116,"./isArguments":118}],120:[function(require,module,exports){
 (function (process){
 'use strict';
 
@@ -33679,9 +33710,9 @@ function nextTick(fn) {
 }
 
 }).call(this,require('_process'))
-},{"_process":237}],116:[function(require,module,exports){
-arguments[4][56][0].apply(exports,arguments)
-},{"dup":56}],117:[function(require,module,exports){
+},{"_process":243}],121:[function(require,module,exports){
+arguments[4][36][0].apply(exports,arguments)
+},{"dup":36}],122:[function(require,module,exports){
 // a duplex stream is just a stream that is both readable and writable.
 // Since JS doesn't have multiple prototypal inheritance, this class
 // prototypally inherits from Readable, and then parasitically from
@@ -33757,7 +33788,7 @@ function forEach(xs, f) {
     f(xs[i], i);
   }
 }
-},{"./_stream_readable":119,"./_stream_writable":121,"core-util-is":34,"inherits":74,"process-nextick-args":115}],118:[function(require,module,exports){
+},{"./_stream_readable":124,"./_stream_writable":126,"core-util-is":14,"inherits":79,"process-nextick-args":120}],123:[function(require,module,exports){
 // a passthrough stream.
 // basically just the most minimal sort of Transform stream.
 // Every written chunk gets output as-is.
@@ -33784,7 +33815,7 @@ function PassThrough(options) {
 PassThrough.prototype._transform = function (chunk, encoding, cb) {
   cb(null, chunk);
 };
-},{"./_stream_transform":120,"core-util-is":34,"inherits":74}],119:[function(require,module,exports){
+},{"./_stream_transform":125,"core-util-is":14,"inherits":79}],124:[function(require,module,exports){
 (function (process){
 'use strict';
 
@@ -34667,7 +34698,7 @@ function indexOf(xs, x) {
   return -1;
 }
 }).call(this,require('_process'))
-},{"./_stream_duplex":117,"_process":237,"buffer":179,"core-util-is":34,"events":216,"inherits":74,"isarray":122,"process-nextick-args":115,"string_decoder/":131,"util":153}],120:[function(require,module,exports){
+},{"./_stream_duplex":122,"_process":243,"buffer":185,"core-util-is":14,"events":222,"inherits":79,"isarray":127,"process-nextick-args":120,"string_decoder/":136,"util":159}],125:[function(require,module,exports){
 // a transform stream is a readable/writable stream where you do
 // something with the data.  Sometimes it's called a "filter",
 // but that's not a great name for it, since that implies a thing where
@@ -34848,7 +34879,7 @@ function done(stream, er) {
 
   return stream.push(null);
 }
-},{"./_stream_duplex":117,"core-util-is":34,"inherits":74}],121:[function(require,module,exports){
+},{"./_stream_duplex":122,"core-util-is":14,"inherits":79}],126:[function(require,module,exports){
 (function (process){
 // A bit simpler than readable streams.
 // Implement an async ._write(chunk, encoding, cb), and it'll handle all
@@ -35367,14 +35398,14 @@ function CorkedRequest(state) {
   };
 }
 }).call(this,require('_process'))
-},{"./_stream_duplex":117,"_process":237,"buffer":179,"core-util-is":34,"events":216,"inherits":74,"process-nextick-args":115,"util-deprecate":132}],122:[function(require,module,exports){
+},{"./_stream_duplex":122,"_process":243,"buffer":185,"core-util-is":14,"events":222,"inherits":79,"process-nextick-args":120,"util-deprecate":137}],127:[function(require,module,exports){
 var toString = {}.toString;
 
 module.exports = Array.isArray || function (arr) {
   return toString.call(arr) == '[object Array]';
 };
 
-},{}],123:[function(require,module,exports){
+},{}],128:[function(require,module,exports){
 var Stream = (function (){
   try {
     return require('st' + 'ream'); // hack to fix a circular dependency issue when used with browserify
@@ -35388,7 +35419,7 @@ exports.Duplex = require('./lib/_stream_duplex.js');
 exports.Transform = require('./lib/_stream_transform.js');
 exports.PassThrough = require('./lib/_stream_passthrough.js');
 
-},{"./lib/_stream_duplex.js":117,"./lib/_stream_passthrough.js":118,"./lib/_stream_readable.js":119,"./lib/_stream_transform.js":120,"./lib/_stream_writable.js":121}],124:[function(require,module,exports){
+},{"./lib/_stream_duplex.js":122,"./lib/_stream_passthrough.js":123,"./lib/_stream_readable.js":124,"./lib/_stream_transform.js":125,"./lib/_stream_writable.js":126}],129:[function(require,module,exports){
 (function (Buffer){
 const assert = require('assert')
 /**
@@ -35621,12 +35652,12 @@ function toBuffer (v) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"assert":149,"buffer":179}],125:[function(require,module,exports){
+},{"assert":155,"buffer":185}],130:[function(require,module,exports){
 'use strict'
 
 module.exports = require('./lib')(require('./lib/elliptic'))
 
-},{"./lib":128,"./lib/elliptic":127}],126:[function(require,module,exports){
+},{"./lib":133,"./lib/elliptic":132}],131:[function(require,module,exports){
 (function (Buffer){
 'use strict'
 
@@ -35695,7 +35726,7 @@ exports.isNumberInInterval = function (number, x, y, message) {
 }
 
 }).call(this,{"isBuffer":require("../../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js")})
-},{"../../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js":227}],127:[function(require,module,exports){
+},{"../../../../../../../../usr/local/lib/node_modules/browserify/node_modules/is-buffer/index.js":233}],132:[function(require,module,exports){
 (function (Buffer){
 'use strict'
 
@@ -36072,7 +36103,7 @@ exports.ecdh = function (publicKey, privateKey) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"../messages.json":129,"bn.js":31,"buffer":179,"elliptic":37}],128:[function(require,module,exports){
+},{"../messages.json":134,"bn.js":11,"buffer":185,"elliptic":17}],133:[function(require,module,exports){
 (function (Buffer){
 'use strict'
 
@@ -36574,7 +36605,7 @@ module.exports = function (secp256k1) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"./assert":126,"./messages.json":129,"buffer":179}],129:[function(require,module,exports){
+},{"./assert":131,"./messages.json":134,"buffer":185}],134:[function(require,module,exports){
 module.exports={
   "COMPRESSED_TYPE_INVALID": "compressed should be a boolean",
   "EC_PRIVATE_KEY_TYPE_INVALID": "private key should be a Buffer",
@@ -36612,7 +36643,7 @@ module.exports={
   "TWEAK_LENGTH_INVALID": "tweak length is invalid"
 }
 
-},{}],130:[function(require,module,exports){
+},{}],135:[function(require,module,exports){
 (function (process){
 ;(function(global) {
 
@@ -36711,7 +36742,7 @@ if (typeof exports === 'object') {
 }(this));
 
 }).call(this,require('_process'))
-},{"_process":237}],131:[function(require,module,exports){
+},{"_process":243}],136:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -36934,7 +36965,7 @@ function base64DetectIncompleteChar(buffer) {
   this.charLength = this.charReceived ? 3 : 0;
 }
 
-},{"buffer":179}],132:[function(require,module,exports){
+},{"buffer":185}],137:[function(require,module,exports){
 (function (global){
 
 /**
@@ -37005,7 +37036,7 @@ function config (name) {
 }
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],133:[function(require,module,exports){
+},{}],138:[function(require,module,exports){
 module.exports = hasKeys
 
 function hasKeys(source) {
@@ -37014,7 +37045,7 @@ function hasKeys(source) {
         typeof source === "function")
 }
 
-},{}],134:[function(require,module,exports){
+},{}],139:[function(require,module,exports){
 var Keys = require("object-keys")
 var hasKeys = require("./has-keys")
 
@@ -37041,7 +37072,19 @@ function extend() {
     return target
 }
 
-},{"./has-keys":133,"object-keys":112}],135:[function(require,module,exports){
+},{"./has-keys":138,"object-keys":117}],140:[function(require,module,exports){
+module.exports = {
+  Account: require('ethereumjs-account'),
+  Buffer: require('buffer'),
+  BN: require('ethereumjs-util').BN,
+  RLP: require('ethereumjs-util').rlp,
+  Trie: require('merkle-patricia-tree'),
+  Tx: require('ethereumjs-tx'),
+  Util: require('ethereumjs-util'),
+  VM: require('ethereumjs-vm')
+}
+
+},{"buffer":185,"ethereumjs-account":39,"ethereumjs-tx":46,"ethereumjs-util":47,"ethereumjs-vm":48,"merkle-patricia-tree":110}],141:[function(require,module,exports){
 var asn1 = exports;
 
 asn1.bignum = require('bn.js');
@@ -37052,7 +37095,7 @@ asn1.constants = require('./asn1/constants');
 asn1.decoders = require('./asn1/decoders');
 asn1.encoders = require('./asn1/encoders');
 
-},{"./asn1/api":136,"./asn1/base":138,"./asn1/constants":142,"./asn1/decoders":144,"./asn1/encoders":147,"bn.js":151}],136:[function(require,module,exports){
+},{"./asn1/api":142,"./asn1/base":144,"./asn1/constants":148,"./asn1/decoders":150,"./asn1/encoders":153,"bn.js":157}],142:[function(require,module,exports){
 var asn1 = require('../asn1');
 var inherits = require('inherits');
 
@@ -37113,7 +37156,7 @@ Entity.prototype.encode = function encode(data, enc, /* internal */ reporter) {
   return this._getEncoder(enc).encode(data, reporter);
 };
 
-},{"../asn1":135,"inherits":226,"vm":270}],137:[function(require,module,exports){
+},{"../asn1":141,"inherits":232,"vm":276}],143:[function(require,module,exports){
 var inherits = require('inherits');
 var Reporter = require('../base').Reporter;
 var Buffer = require('buffer').Buffer;
@@ -37231,7 +37274,7 @@ EncoderBuffer.prototype.join = function join(out, offset) {
   return out;
 };
 
-},{"../base":138,"buffer":179,"inherits":226}],138:[function(require,module,exports){
+},{"../base":144,"buffer":185,"inherits":232}],144:[function(require,module,exports){
 var base = exports;
 
 base.Reporter = require('./reporter').Reporter;
@@ -37239,7 +37282,7 @@ base.DecoderBuffer = require('./buffer').DecoderBuffer;
 base.EncoderBuffer = require('./buffer').EncoderBuffer;
 base.Node = require('./node');
 
-},{"./buffer":137,"./node":139,"./reporter":140}],139:[function(require,module,exports){
+},{"./buffer":143,"./node":145,"./reporter":146}],145:[function(require,module,exports){
 var Reporter = require('../base').Reporter;
 var EncoderBuffer = require('../base').EncoderBuffer;
 var assert = require('minimalistic-assert');
@@ -37851,7 +37894,7 @@ Node.prototype._isNumstr = function isNumstr(str) {
 Node.prototype._isPrintstr = function isPrintstr(str) {
   return /^[A-Za-z0-9 '\(\)\+,\-\.\/:=\?]*$/.test(str);
 };
-},{"../base":138,"minimalistic-assert":230}],140:[function(require,module,exports){
+},{"../base":144,"minimalistic-assert":236}],146:[function(require,module,exports){
 var inherits = require('inherits');
 
 function Reporter(options) {
@@ -37955,7 +37998,7 @@ ReporterError.prototype.rethrow = function rethrow(msg) {
   return this;
 };
 
-},{"inherits":226}],141:[function(require,module,exports){
+},{"inherits":232}],147:[function(require,module,exports){
 var constants = require('../constants');
 
 exports.tagClass = {
@@ -37999,7 +38042,7 @@ exports.tag = {
 };
 exports.tagByName = constants._reverse(exports.tag);
 
-},{"../constants":142}],142:[function(require,module,exports){
+},{"../constants":148}],148:[function(require,module,exports){
 var constants = exports;
 
 // Helper
@@ -38020,7 +38063,7 @@ constants._reverse = function reverse(map) {
 
 constants.der = require('./der');
 
-},{"./der":141}],143:[function(require,module,exports){
+},{"./der":147}],149:[function(require,module,exports){
 var inherits = require('inherits');
 
 var asn1 = require('../../asn1');
@@ -38344,13 +38387,13 @@ function derDecodeLen(buf, primitive, fail) {
   return len;
 }
 
-},{"../../asn1":135,"inherits":226}],144:[function(require,module,exports){
+},{"../../asn1":141,"inherits":232}],150:[function(require,module,exports){
 var decoders = exports;
 
 decoders.der = require('./der');
 decoders.pem = require('./pem');
 
-},{"./der":143,"./pem":145}],145:[function(require,module,exports){
+},{"./der":149,"./pem":151}],151:[function(require,module,exports){
 var inherits = require('inherits');
 var Buffer = require('buffer').Buffer;
 
@@ -38402,7 +38445,7 @@ PEMDecoder.prototype.decode = function decode(data, options) {
   return DERDecoder.prototype.decode.call(this, input, options);
 };
 
-},{"../../asn1":135,"./der":143,"buffer":179,"inherits":226}],146:[function(require,module,exports){
+},{"../../asn1":141,"./der":149,"buffer":185,"inherits":232}],152:[function(require,module,exports){
 var inherits = require('inherits');
 var Buffer = require('buffer').Buffer;
 
@@ -38702,13 +38745,13 @@ function encodeTag(tag, primitive, cls, reporter) {
   return res;
 }
 
-},{"../../asn1":135,"buffer":179,"inherits":226}],147:[function(require,module,exports){
+},{"../../asn1":141,"buffer":185,"inherits":232}],153:[function(require,module,exports){
 var encoders = exports;
 
 encoders.der = require('./der');
 encoders.pem = require('./pem');
 
-},{"./der":146,"./pem":148}],148:[function(require,module,exports){
+},{"./der":152,"./pem":154}],154:[function(require,module,exports){
 var inherits = require('inherits');
 var Buffer = require('buffer').Buffer;
 
@@ -38733,7 +38776,7 @@ PEMEncoder.prototype.encode = function encode(data, options) {
   return out.join('\n');
 };
 
-},{"../../asn1":135,"./der":146,"buffer":179,"inherits":226}],149:[function(require,module,exports){
+},{"../../asn1":141,"./der":152,"buffer":185,"inherits":232}],155:[function(require,module,exports){
 // http://wiki.commonjs.org/wiki/Unit_Testing/1.0
 //
 // THIS IS NOT TESTED NOR LIKELY TO WORK OUTSIDE V8!
@@ -39094,7 +39137,7 @@ var objectKeys = Object.keys || function (obj) {
   return keys;
 };
 
-},{"util/":269}],150:[function(require,module,exports){
+},{"util/":275}],156:[function(require,module,exports){
 ;(function (exports) {
   'use strict'
 
@@ -39214,7 +39257,7 @@ var objectKeys = Object.keys || function (obj) {
   exports.fromByteArray = uint8ToBase64
 }(typeof exports === 'undefined' ? (this.base64js = {}) : exports))
 
-},{}],151:[function(require,module,exports){
+},{}],157:[function(require,module,exports){
 (function (module, exports) {
   'use strict';
 
@@ -42535,11 +42578,11 @@ var objectKeys = Object.keys || function (obj) {
   };
 })(typeof module === 'undefined' || module, this);
 
-},{}],152:[function(require,module,exports){
-arguments[4][32][0].apply(exports,arguments)
-},{"dup":32}],153:[function(require,module,exports){
+},{}],158:[function(require,module,exports){
+arguments[4][12][0].apply(exports,arguments)
+},{"dup":12}],159:[function(require,module,exports){
 
-},{}],154:[function(require,module,exports){
+},{}],160:[function(require,module,exports){
 (function (Buffer){
 // based on the aes implimentation in triple sec
 // https://github.com/keybase/triplesec
@@ -42720,7 +42763,7 @@ AES.prototype._doCryptBlock = function (M, keySchedule, SUB_MIX, SBOX) {
 exports.AES = AES
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179}],155:[function(require,module,exports){
+},{"buffer":185}],161:[function(require,module,exports){
 (function (Buffer){
 var aes = require('./aes')
 var Transform = require('cipher-base')
@@ -42821,7 +42864,7 @@ function xorTest (a, b) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"./aes":154,"./ghash":159,"buffer":179,"buffer-xor":178,"cipher-base":181,"inherits":226}],156:[function(require,module,exports){
+},{"./aes":160,"./ghash":165,"buffer":185,"buffer-xor":184,"cipher-base":187,"inherits":232}],162:[function(require,module,exports){
 var ciphers = require('./encrypter')
 exports.createCipher = exports.Cipher = ciphers.createCipher
 exports.createCipheriv = exports.Cipheriv = ciphers.createCipheriv
@@ -42834,7 +42877,7 @@ function getCiphers () {
 }
 exports.listCiphers = exports.getCiphers = getCiphers
 
-},{"./decrypter":157,"./encrypter":158,"./modes":160}],157:[function(require,module,exports){
+},{"./decrypter":163,"./encrypter":164,"./modes":166}],163:[function(require,module,exports){
 (function (Buffer){
 var aes = require('./aes')
 var Transform = require('cipher-base')
@@ -42974,7 +43017,7 @@ exports.createDecipher = createDecipher
 exports.createDecipheriv = createDecipheriv
 
 }).call(this,require("buffer").Buffer)
-},{"./aes":154,"./authCipher":155,"./modes":160,"./modes/cbc":161,"./modes/cfb":162,"./modes/cfb1":163,"./modes/cfb8":164,"./modes/ctr":165,"./modes/ecb":166,"./modes/ofb":167,"./streamCipher":168,"buffer":179,"cipher-base":181,"evp_bytestokey":217,"inherits":226}],158:[function(require,module,exports){
+},{"./aes":160,"./authCipher":161,"./modes":166,"./modes/cbc":167,"./modes/cfb":168,"./modes/cfb1":169,"./modes/cfb8":170,"./modes/ctr":171,"./modes/ecb":172,"./modes/ofb":173,"./streamCipher":174,"buffer":185,"cipher-base":187,"evp_bytestokey":223,"inherits":232}],164:[function(require,module,exports){
 (function (Buffer){
 var aes = require('./aes')
 var Transform = require('cipher-base')
@@ -43099,7 +43142,7 @@ exports.createCipheriv = createCipheriv
 exports.createCipher = createCipher
 
 }).call(this,require("buffer").Buffer)
-},{"./aes":154,"./authCipher":155,"./modes":160,"./modes/cbc":161,"./modes/cfb":162,"./modes/cfb1":163,"./modes/cfb8":164,"./modes/ctr":165,"./modes/ecb":166,"./modes/ofb":167,"./streamCipher":168,"buffer":179,"cipher-base":181,"evp_bytestokey":217,"inherits":226}],159:[function(require,module,exports){
+},{"./aes":160,"./authCipher":161,"./modes":166,"./modes/cbc":167,"./modes/cfb":168,"./modes/cfb1":169,"./modes/cfb8":170,"./modes/ctr":171,"./modes/ecb":172,"./modes/ofb":173,"./streamCipher":174,"buffer":185,"cipher-base":187,"evp_bytestokey":223,"inherits":232}],165:[function(require,module,exports){
 (function (Buffer){
 var zeros = new Buffer(16)
 zeros.fill(0)
@@ -43201,7 +43244,7 @@ function xor (a, b) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179}],160:[function(require,module,exports){
+},{"buffer":185}],166:[function(require,module,exports){
 exports['aes-128-ecb'] = {
   cipher: 'AES',
   key: 128,
@@ -43374,7 +43417,7 @@ exports['aes-256-gcm'] = {
   type: 'auth'
 }
 
-},{}],161:[function(require,module,exports){
+},{}],167:[function(require,module,exports){
 var xor = require('buffer-xor')
 
 exports.encrypt = function (self, block) {
@@ -43393,7 +43436,7 @@ exports.decrypt = function (self, block) {
   return xor(out, pad)
 }
 
-},{"buffer-xor":178}],162:[function(require,module,exports){
+},{"buffer-xor":184}],168:[function(require,module,exports){
 (function (Buffer){
 var xor = require('buffer-xor')
 
@@ -43428,7 +43471,7 @@ function encryptStart (self, data, decrypt) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179,"buffer-xor":178}],163:[function(require,module,exports){
+},{"buffer":185,"buffer-xor":184}],169:[function(require,module,exports){
 (function (Buffer){
 function encryptByte (self, byteParam, decrypt) {
   var pad
@@ -43466,7 +43509,7 @@ function shiftIn (buffer, value) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179}],164:[function(require,module,exports){
+},{"buffer":185}],170:[function(require,module,exports){
 (function (Buffer){
 function encryptByte (self, byteParam, decrypt) {
   var pad = self._cipher.encryptBlock(self._prev)
@@ -43485,7 +43528,7 @@ exports.encrypt = function (self, chunk, decrypt) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179}],165:[function(require,module,exports){
+},{"buffer":185}],171:[function(require,module,exports){
 (function (Buffer){
 var xor = require('buffer-xor')
 
@@ -43520,7 +43563,7 @@ exports.encrypt = function (self, chunk) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179,"buffer-xor":178}],166:[function(require,module,exports){
+},{"buffer":185,"buffer-xor":184}],172:[function(require,module,exports){
 exports.encrypt = function (self, block) {
   return self._cipher.encryptBlock(block)
 }
@@ -43528,7 +43571,7 @@ exports.decrypt = function (self, block) {
   return self._cipher.decryptBlock(block)
 }
 
-},{}],167:[function(require,module,exports){
+},{}],173:[function(require,module,exports){
 (function (Buffer){
 var xor = require('buffer-xor')
 
@@ -43548,7 +43591,7 @@ exports.encrypt = function (self, chunk) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179,"buffer-xor":178}],168:[function(require,module,exports){
+},{"buffer":185,"buffer-xor":184}],174:[function(require,module,exports){
 (function (Buffer){
 var aes = require('./aes')
 var Transform = require('cipher-base')
@@ -43577,7 +43620,7 @@ StreamCipher.prototype._final = function () {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"./aes":154,"buffer":179,"cipher-base":181,"inherits":226}],169:[function(require,module,exports){
+},{"./aes":160,"buffer":185,"cipher-base":187,"inherits":232}],175:[function(require,module,exports){
 var ebtk = require('evp_bytestokey')
 var aes = require('browserify-aes/browser')
 var DES = require('browserify-des')
@@ -43652,7 +43695,7 @@ function getCiphers () {
 }
 exports.listCiphers = exports.getCiphers = getCiphers
 
-},{"browserify-aes/browser":156,"browserify-aes/modes":160,"browserify-des":170,"browserify-des/modes":171,"evp_bytestokey":217}],170:[function(require,module,exports){
+},{"browserify-aes/browser":162,"browserify-aes/modes":166,"browserify-des":176,"browserify-des/modes":177,"evp_bytestokey":223}],176:[function(require,module,exports){
 (function (Buffer){
 var CipherBase = require('cipher-base')
 var des = require('des.js')
@@ -43699,7 +43742,7 @@ DES.prototype._final = function () {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179,"cipher-base":181,"des.js":189,"inherits":226}],171:[function(require,module,exports){
+},{"buffer":185,"cipher-base":187,"des.js":195,"inherits":232}],177:[function(require,module,exports){
 exports['des-ecb'] = {
   key: 8,
   iv: 0
@@ -43725,7 +43768,7 @@ exports['des-ede'] = {
   iv: 0
 }
 
-},{}],172:[function(require,module,exports){
+},{}],178:[function(require,module,exports){
 (function (Buffer){
 var bn = require('bn.js');
 var randomBytes = require('randombytes');
@@ -43769,7 +43812,7 @@ function getr(priv) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"bn.js":151,"buffer":179,"randombytes":244}],173:[function(require,module,exports){
+},{"bn.js":157,"buffer":185,"randombytes":250}],179:[function(require,module,exports){
 (function (Buffer){
 'use strict'
 exports['RSA-SHA224'] = exports.sha224WithRSAEncryption = {
@@ -43845,7 +43888,7 @@ exports['RSA-MD5'] = exports.md5WithRSAEncryption = {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179}],174:[function(require,module,exports){
+},{"buffer":185}],180:[function(require,module,exports){
 (function (Buffer){
 var _algos = require('./algos')
 var createHash = require('create-hash')
@@ -43952,7 +43995,7 @@ module.exports = {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"./algos":173,"./sign":176,"./verify":177,"buffer":179,"create-hash":184,"inherits":226,"stream":264}],175:[function(require,module,exports){
+},{"./algos":179,"./sign":182,"./verify":183,"buffer":185,"create-hash":190,"inherits":232,"stream":270}],181:[function(require,module,exports){
 'use strict'
 exports['1.3.132.0.10'] = 'secp256k1'
 
@@ -43966,7 +44009,7 @@ exports['1.3.132.0.34'] = 'p384'
 
 exports['1.3.132.0.35'] = 'p521'
 
-},{}],176:[function(require,module,exports){
+},{}],182:[function(require,module,exports){
 (function (Buffer){
 // much of this based on https://github.com/indutny/self-signed/blob/gh-pages/lib/rsa.js
 var createHmac = require('create-hmac')
@@ -44155,7 +44198,7 @@ module.exports.getKey = getKey
 module.exports.makeKey = makeKey
 
 }).call(this,require("buffer").Buffer)
-},{"./curves":175,"bn.js":151,"browserify-rsa":172,"buffer":179,"create-hmac":187,"elliptic":199,"parse-asn1":234}],177:[function(require,module,exports){
+},{"./curves":181,"bn.js":157,"browserify-rsa":178,"buffer":185,"create-hmac":193,"elliptic":205,"parse-asn1":240}],183:[function(require,module,exports){
 (function (Buffer){
 // much of this based on https://github.com/indutny/self-signed/blob/gh-pages/lib/rsa.js
 var curves = require('./curves')
@@ -44262,7 +44305,7 @@ function checkValue (b, q) {
 module.exports = verify
 
 }).call(this,require("buffer").Buffer)
-},{"./curves":175,"bn.js":151,"buffer":179,"elliptic":199,"parse-asn1":234}],178:[function(require,module,exports){
+},{"./curves":181,"bn.js":157,"buffer":185,"elliptic":205,"parse-asn1":240}],184:[function(require,module,exports){
 (function (Buffer){
 module.exports = function xor (a, b) {
   var length = Math.min(a.length, b.length)
@@ -44276,7 +44319,7 @@ module.exports = function xor (a, b) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179}],179:[function(require,module,exports){
+},{"buffer":185}],185:[function(require,module,exports){
 (function (global){
 /*!
  * The buffer module from node.js, for the browser.
@@ -45732,9 +45775,9 @@ function blitBuffer (src, dst, offset, length) {
 }
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"base64-js":150,"ieee754":224,"isarray":180}],180:[function(require,module,exports){
-arguments[4][122][0].apply(exports,arguments)
-},{"dup":122}],181:[function(require,module,exports){
+},{"base64-js":156,"ieee754":230,"isarray":186}],186:[function(require,module,exports){
+arguments[4][127][0].apply(exports,arguments)
+},{"dup":127}],187:[function(require,module,exports){
 (function (Buffer){
 var Transform = require('stream').Transform
 var inherits = require('inherits')
@@ -45828,7 +45871,7 @@ CipherBase.prototype._toString = function (value, enc, final) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179,"inherits":226,"stream":264,"string_decoder":265}],182:[function(require,module,exports){
+},{"buffer":185,"inherits":232,"stream":270,"string_decoder":271}],188:[function(require,module,exports){
 (function (Buffer){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -45939,7 +45982,7 @@ function objectToString(o) {
 }
 
 }).call(this,{"isBuffer":require("../../is-buffer/index.js")})
-},{"../../is-buffer/index.js":227}],183:[function(require,module,exports){
+},{"../../is-buffer/index.js":233}],189:[function(require,module,exports){
 (function (Buffer){
 var elliptic = require('elliptic');
 var BN = require('bn.js');
@@ -46065,7 +46108,7 @@ function formatReturnValue(bn, enc, len) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"bn.js":151,"buffer":179,"elliptic":199}],184:[function(require,module,exports){
+},{"bn.js":157,"buffer":185,"elliptic":205}],190:[function(require,module,exports){
 (function (Buffer){
 'use strict';
 var inherits = require('inherits')
@@ -46121,7 +46164,7 @@ module.exports = function createHash (alg) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"./md5":186,"buffer":179,"cipher-base":181,"inherits":226,"ripemd160":255,"sha.js":257}],185:[function(require,module,exports){
+},{"./md5":192,"buffer":185,"cipher-base":187,"inherits":232,"ripemd160":261,"sha.js":263}],191:[function(require,module,exports){
 (function (Buffer){
 'use strict';
 var intSize = 4;
@@ -46158,7 +46201,7 @@ function hash(buf, fn, hashSize, bigEndian) {
 }
 exports.hash = hash;
 }).call(this,require("buffer").Buffer)
-},{"buffer":179}],186:[function(require,module,exports){
+},{"buffer":185}],192:[function(require,module,exports){
 'use strict';
 /*
  * A JavaScript implementation of the RSA Data Security, Inc. MD5 Message
@@ -46315,7 +46358,7 @@ function bit_rol(num, cnt)
 module.exports = function md5(buf) {
   return helpers.hash(buf, core_md5, 16);
 };
-},{"./helpers":185}],187:[function(require,module,exports){
+},{"./helpers":191}],193:[function(require,module,exports){
 (function (Buffer){
 'use strict';
 var createHash = require('create-hash/browser');
@@ -46387,7 +46430,7 @@ module.exports = function createHmac(alg, key) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179,"create-hash/browser":184,"inherits":226,"stream":264}],188:[function(require,module,exports){
+},{"buffer":185,"create-hash/browser":190,"inherits":232,"stream":270}],194:[function(require,module,exports){
 'use strict'
 
 exports.randomBytes = exports.rng = exports.pseudoRandomBytes = exports.prng = require('randombytes')
@@ -46466,7 +46509,7 @@ var publicEncrypt = require('public-encrypt')
   }
 })
 
-},{"browserify-cipher":169,"browserify-sign":174,"browserify-sign/algos":173,"create-ecdh":183,"create-hash":184,"create-hmac":187,"diffie-hellman":195,"pbkdf2":235,"public-encrypt":238,"randombytes":244}],189:[function(require,module,exports){
+},{"browserify-cipher":175,"browserify-sign":180,"browserify-sign/algos":179,"create-ecdh":189,"create-hash":190,"create-hmac":193,"diffie-hellman":201,"pbkdf2":241,"public-encrypt":244,"randombytes":250}],195:[function(require,module,exports){
 'use strict';
 
 exports.utils = require('./des/utils');
@@ -46475,7 +46518,7 @@ exports.DES = require('./des/des');
 exports.CBC = require('./des/cbc');
 exports.EDE = require('./des/ede');
 
-},{"./des/cbc":190,"./des/cipher":191,"./des/des":192,"./des/ede":193,"./des/utils":194}],190:[function(require,module,exports){
+},{"./des/cbc":196,"./des/cipher":197,"./des/des":198,"./des/ede":199,"./des/utils":200}],196:[function(require,module,exports){
 'use strict';
 
 var assert = require('minimalistic-assert');
@@ -46542,7 +46585,7 @@ proto._update = function _update(inp, inOff, out, outOff) {
   }
 };
 
-},{"inherits":226,"minimalistic-assert":230}],191:[function(require,module,exports){
+},{"inherits":232,"minimalistic-assert":236}],197:[function(require,module,exports){
 'use strict';
 
 var assert = require('minimalistic-assert');
@@ -46685,7 +46728,7 @@ Cipher.prototype._finalDecrypt = function _finalDecrypt() {
   return this._unpad(out);
 };
 
-},{"minimalistic-assert":230}],192:[function(require,module,exports){
+},{"minimalistic-assert":236}],198:[function(require,module,exports){
 'use strict';
 
 var assert = require('minimalistic-assert');
@@ -46830,7 +46873,7 @@ DES.prototype._decrypt = function _decrypt(state, lStart, rStart, out, off) {
   utils.rip(l, r, out, off);
 };
 
-},{"../des":189,"inherits":226,"minimalistic-assert":230}],193:[function(require,module,exports){
+},{"../des":195,"inherits":232,"minimalistic-assert":236}],199:[function(require,module,exports){
 'use strict';
 
 var assert = require('minimalistic-assert');
@@ -46887,7 +46930,7 @@ EDE.prototype._update = function _update(inp, inOff, out, outOff) {
 EDE.prototype._pad = DES.prototype._pad;
 EDE.prototype._unpad = DES.prototype._unpad;
 
-},{"../des":189,"inherits":226,"minimalistic-assert":230}],194:[function(require,module,exports){
+},{"../des":195,"inherits":232,"minimalistic-assert":236}],200:[function(require,module,exports){
 'use strict';
 
 exports.readUInt32BE = function readUInt32BE(bytes, off) {
@@ -47145,7 +47188,7 @@ exports.padSplit = function padSplit(num, size, group) {
   return out.join(' ');
 };
 
-},{}],195:[function(require,module,exports){
+},{}],201:[function(require,module,exports){
 (function (Buffer){
 var generatePrime = require('./lib/generatePrime')
 var primes = require('./lib/primes')
@@ -47191,7 +47234,7 @@ exports.DiffieHellmanGroup = exports.createDiffieHellmanGroup = exports.getDiffi
 exports.createDiffieHellman = exports.DiffieHellman = createDiffieHellman
 
 }).call(this,require("buffer").Buffer)
-},{"./lib/dh":196,"./lib/generatePrime":197,"./lib/primes":198,"buffer":179}],196:[function(require,module,exports){
+},{"./lib/dh":202,"./lib/generatePrime":203,"./lib/primes":204,"buffer":185}],202:[function(require,module,exports){
 (function (Buffer){
 var BN = require('bn.js');
 var MillerRabin = require('miller-rabin');
@@ -47359,7 +47402,7 @@ function formatReturnValue(bn, enc) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"./generatePrime":197,"bn.js":151,"buffer":179,"miller-rabin":229,"randombytes":244}],197:[function(require,module,exports){
+},{"./generatePrime":203,"bn.js":157,"buffer":185,"miller-rabin":235,"randombytes":250}],203:[function(require,module,exports){
 var randomBytes = require('randombytes');
 module.exports = findPrime;
 findPrime.simpleSieve = simpleSieve;
@@ -47466,7 +47509,7 @@ function findPrime(bits, gen) {
 
 }
 
-},{"bn.js":151,"miller-rabin":229,"randombytes":244}],198:[function(require,module,exports){
+},{"bn.js":157,"miller-rabin":235,"randombytes":250}],204:[function(require,module,exports){
 module.exports={
     "modp1": {
         "gen": "02",
@@ -47501,9 +47544,9 @@ module.exports={
         "prime": "ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3be39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aaac42dad33170d04507a33a85521abdf1cba64ecfb850458dbef0a8aea71575d060c7db3970f85a6e1e4c7abf5ae8cdb0933d71e8c94e04a25619dcee3d2261ad2ee6bf12ffa06d98a0864d87602733ec86a64521f2b18177b200cbbe117577a615d6c770988c0bad946e208e24fa074e5ab3143db5bfce0fd108e4b82d120a92108011a723c12a787e6d788719a10bdba5b2699c327186af4e23c1a946834b6150bda2583e9ca2ad44ce8dbbbc2db04de8ef92e8efc141fbecaa6287c59474e6bc05d99b2964fa090c3a2233ba186515be7ed1f612970cee2d7afb81bdd762170481cd0069127d5b05aa993b4ea988d8fddc186ffb7dc90a6c08f4df435c93402849236c3fab4d27c7026c1d4dcb2602646dec9751e763dba37bdf8ff9406ad9e530ee5db382f413001aeb06a53ed9027d831179727b0865a8918da3edbebcf9b14ed44ce6cbaced4bb1bdb7f1447e6cc254b332051512bd7af426fb8f401378cd2bf5983ca01c64b92ecf032ea15d1721d03f482d7ce6e74fef6d55e702f46980c82b5a84031900b1c9e59e7c97fbec7e8f323a97a7e36cc88be0f1d45b7ff585ac54bd407b22b4154aacc8f6d7ebf48e1d814cc5ed20f8037e0a79715eef29be32806a1d58bb7c5da76f550aa3d8a1fbff0eb19ccb1a313d55cda56c9ec2ef29632387fe8d76e3c0468043e8f663f4860ee12bf2d5b0b7474d6e694f91e6dbe115974a3926f12fee5e438777cb6a932df8cd8bec4d073b931ba3bc832b68d9dd300741fa7bf8afc47ed2576f6936ba424663aab639c5ae4f5683423b4742bf1c978238f16cbe39d652de3fdb8befc848ad922222e04a4037c0713eb57a81a23f0c73473fc646cea306b4bcbc8862f8385ddfa9d4b7fa2c087e879683303ed5bdd3a062b3cf5b3a278a66d2a13f83f44f82ddf310ee074ab6a364597e899a0255dc164f31cc50846851df9ab48195ded7ea1b1d510bd7ee74d73faf36bc31ecfa268359046f4eb879f924009438b481c6cd7889a002ed5ee382bc9190da6fc026e479558e4475677e9aa9e3050e2765694dfc81f56e880b96e7160c980dd98edd3dfffffffffffffffff"
     }
 }
-},{}],199:[function(require,module,exports){
-arguments[4][37][0].apply(exports,arguments)
-},{"../package.json":215,"./elliptic/curve":202,"./elliptic/curves":205,"./elliptic/ec":206,"./elliptic/eddsa":209,"./elliptic/hmac-drbg":212,"./elliptic/utils":214,"brorand":152,"dup":37}],200:[function(require,module,exports){
+},{}],205:[function(require,module,exports){
+arguments[4][17][0].apply(exports,arguments)
+},{"../package.json":221,"./elliptic/curve":208,"./elliptic/curves":211,"./elliptic/ec":212,"./elliptic/eddsa":215,"./elliptic/hmac-drbg":218,"./elliptic/utils":220,"brorand":158,"dup":17}],206:[function(require,module,exports){
 'use strict';
 
 var bn = require('bn.js');
@@ -47856,7 +47899,7 @@ BasePoint.prototype.dblp = function dblp(k) {
   return r;
 };
 
-},{"../../elliptic":199,"bn.js":151}],201:[function(require,module,exports){
+},{"../../elliptic":205,"bn.js":157}],207:[function(require,module,exports){
 'use strict';
 
 var curve = require('../curve');
@@ -48264,9 +48307,9 @@ Point.prototype.eq = function eq(other) {
 Point.prototype.toP = Point.prototype.normalize;
 Point.prototype.mixedAdd = Point.prototype.add;
 
-},{"../../elliptic":199,"../curve":202,"bn.js":151,"inherits":226}],202:[function(require,module,exports){
-arguments[4][40][0].apply(exports,arguments)
-},{"./base":200,"./edwards":201,"./mont":203,"./short":204,"dup":40}],203:[function(require,module,exports){
+},{"../../elliptic":205,"../curve":208,"bn.js":157,"inherits":232}],208:[function(require,module,exports){
+arguments[4][20][0].apply(exports,arguments)
+},{"./base":206,"./edwards":207,"./mont":209,"./short":210,"dup":20}],209:[function(require,module,exports){
 'use strict';
 
 var curve = require('../curve');
@@ -48444,7 +48487,7 @@ Point.prototype.getX = function getX() {
   return this.x.fromRed();
 };
 
-},{"../../elliptic":199,"../curve":202,"bn.js":151,"inherits":226}],204:[function(require,module,exports){
+},{"../../elliptic":205,"../curve":208,"bn.js":157,"inherits":232}],210:[function(require,module,exports){
 'use strict';
 
 var curve = require('../curve');
@@ -49353,9 +49396,9 @@ JPoint.prototype.isInfinity = function isInfinity() {
   return this.z.cmpn(0) === 0;
 };
 
-},{"../../elliptic":199,"../curve":202,"bn.js":151,"inherits":226}],205:[function(require,module,exports){
-arguments[4][43][0].apply(exports,arguments)
-},{"../elliptic":199,"./precomputed/secp256k1":213,"dup":43,"hash.js":218}],206:[function(require,module,exports){
+},{"../../elliptic":205,"../curve":208,"bn.js":157,"inherits":232}],211:[function(require,module,exports){
+arguments[4][23][0].apply(exports,arguments)
+},{"../elliptic":205,"./precomputed/secp256k1":219,"dup":23,"hash.js":224}],212:[function(require,module,exports){
 'use strict';
 
 var bn = require('bn.js');
@@ -49573,7 +49616,7 @@ EC.prototype.getKeyRecoveryParam = function(e, signature, Q, enc) {
   throw new Error('Unable to find valid recovery factor');
 };
 
-},{"../../elliptic":199,"./key":207,"./signature":208,"bn.js":151}],207:[function(require,module,exports){
+},{"../../elliptic":205,"./key":213,"./signature":214,"bn.js":157}],213:[function(require,module,exports){
 'use strict';
 
 var bn = require('bn.js');
@@ -49682,7 +49725,7 @@ KeyPair.prototype.inspect = function inspect() {
          ' pub: ' + (this.pub && this.pub.inspect()) + ' >';
 };
 
-},{"bn.js":151}],208:[function(require,module,exports){
+},{"bn.js":157}],214:[function(require,module,exports){
 'use strict';
 
 var bn = require('bn.js');
@@ -49819,11 +49862,11 @@ Signature.prototype.toDER = function toDER(enc) {
   return utils.encode(res, enc);
 };
 
-},{"../../elliptic":199,"bn.js":151}],209:[function(require,module,exports){
-arguments[4][47][0].apply(exports,arguments)
-},{"../../elliptic":199,"./key":210,"./signature":211,"dup":47,"hash.js":218}],210:[function(require,module,exports){
-arguments[4][48][0].apply(exports,arguments)
-},{"../../elliptic":199,"dup":48}],211:[function(require,module,exports){
+},{"../../elliptic":205,"bn.js":157}],215:[function(require,module,exports){
+arguments[4][27][0].apply(exports,arguments)
+},{"../../elliptic":205,"./key":216,"./signature":217,"dup":27,"hash.js":224}],216:[function(require,module,exports){
+arguments[4][28][0].apply(exports,arguments)
+},{"../../elliptic":205,"dup":28}],217:[function(require,module,exports){
 'use strict';
 
 var bn = require('bn.js');
@@ -49891,11 +49934,11 @@ Signature.prototype.toHex = function toHex() {
 
 module.exports = Signature;
 
-},{"../../elliptic":199,"bn.js":151}],212:[function(require,module,exports){
-arguments[4][50][0].apply(exports,arguments)
-},{"../elliptic":199,"dup":50,"hash.js":218}],213:[function(require,module,exports){
-arguments[4][51][0].apply(exports,arguments)
-},{"dup":51}],214:[function(require,module,exports){
+},{"../../elliptic":205,"bn.js":157}],218:[function(require,module,exports){
+arguments[4][30][0].apply(exports,arguments)
+},{"../elliptic":205,"dup":30,"hash.js":224}],219:[function(require,module,exports){
+arguments[4][31][0].apply(exports,arguments)
+},{"dup":31}],220:[function(require,module,exports){
 'use strict';
 
 var utils = exports;
@@ -50070,7 +50113,7 @@ function intFromLE(bytes) {
 utils.intFromLE = intFromLE;
 
 
-},{"bn.js":151}],215:[function(require,module,exports){
+},{"bn.js":157}],221:[function(require,module,exports){
 module.exports={
   "_args": [
     [
@@ -50168,7 +50211,7 @@ module.exports={
   "version": "6.0.2"
 }
 
-},{}],216:[function(require,module,exports){
+},{}],222:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -50468,7 +50511,7 @@ function isUndefined(arg) {
   return arg === void 0;
 }
 
-},{}],217:[function(require,module,exports){
+},{}],223:[function(require,module,exports){
 (function (Buffer){
 var md5 = require('create-hash/md5')
 module.exports = EVP_BytesToKey
@@ -50540,19 +50583,19 @@ function EVP_BytesToKey (password, salt, keyLen, ivLen) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179,"create-hash/md5":186}],218:[function(require,module,exports){
-arguments[4][68][0].apply(exports,arguments)
-},{"./hash/common":219,"./hash/hmac":220,"./hash/ripemd":221,"./hash/sha":222,"./hash/utils":223,"dup":68}],219:[function(require,module,exports){
-arguments[4][69][0].apply(exports,arguments)
-},{"../hash":218,"dup":69}],220:[function(require,module,exports){
-arguments[4][70][0].apply(exports,arguments)
-},{"../hash":218,"dup":70}],221:[function(require,module,exports){
-arguments[4][71][0].apply(exports,arguments)
-},{"../hash":218,"dup":71}],222:[function(require,module,exports){
-arguments[4][72][0].apply(exports,arguments)
-},{"../hash":218,"dup":72}],223:[function(require,module,exports){
+},{"buffer":185,"create-hash/md5":192}],224:[function(require,module,exports){
 arguments[4][73][0].apply(exports,arguments)
-},{"dup":73,"inherits":226}],224:[function(require,module,exports){
+},{"./hash/common":225,"./hash/hmac":226,"./hash/ripemd":227,"./hash/sha":228,"./hash/utils":229,"dup":73}],225:[function(require,module,exports){
+arguments[4][74][0].apply(exports,arguments)
+},{"../hash":224,"dup":74}],226:[function(require,module,exports){
+arguments[4][75][0].apply(exports,arguments)
+},{"../hash":224,"dup":75}],227:[function(require,module,exports){
+arguments[4][76][0].apply(exports,arguments)
+},{"../hash":224,"dup":76}],228:[function(require,module,exports){
+arguments[4][77][0].apply(exports,arguments)
+},{"../hash":224,"dup":77}],229:[function(require,module,exports){
+arguments[4][78][0].apply(exports,arguments)
+},{"dup":78,"inherits":232}],230:[function(require,module,exports){
 exports.read = function (buffer, offset, isLE, mLen, nBytes) {
   var e, m
   var eLen = nBytes * 8 - mLen - 1
@@ -50638,7 +50681,7 @@ exports.write = function (buffer, value, offset, isLE, mLen, nBytes) {
   buffer[offset + i - d] |= s * 128
 }
 
-},{}],225:[function(require,module,exports){
+},{}],231:[function(require,module,exports){
 
 var indexOf = [].indexOf;
 
@@ -50649,9 +50692,9 @@ module.exports = function(arr, obj){
   }
   return -1;
 };
-},{}],226:[function(require,module,exports){
-arguments[4][74][0].apply(exports,arguments)
-},{"dup":74}],227:[function(require,module,exports){
+},{}],232:[function(require,module,exports){
+arguments[4][79][0].apply(exports,arguments)
+},{"dup":79}],233:[function(require,module,exports){
 /**
  * Determine if an object is Buffer
  *
@@ -50670,9 +50713,9 @@ module.exports = function (obj) {
     ))
 }
 
-},{}],228:[function(require,module,exports){
-arguments[4][75][0].apply(exports,arguments)
-},{"dup":75}],229:[function(require,module,exports){
+},{}],234:[function(require,module,exports){
+arguments[4][80][0].apply(exports,arguments)
+},{"dup":80}],235:[function(require,module,exports){
 var bn = require('bn.js');
 var brorand = require('brorand');
 
@@ -50787,7 +50830,7 @@ MillerRabin.prototype.getDivisor = function getDivisor(n, k) {
   return false;
 };
 
-},{"bn.js":151,"brorand":152}],230:[function(require,module,exports){
+},{"bn.js":157,"brorand":158}],236:[function(require,module,exports){
 module.exports = assert;
 
 function assert(val, msg) {
@@ -50800,7 +50843,7 @@ assert.equal = function assertEqual(l, r, msg) {
     throw new Error(msg || ('Assertion failed: ' + l + ' != ' + r));
 };
 
-},{}],231:[function(require,module,exports){
+},{}],237:[function(require,module,exports){
 module.exports={"2.16.840.1.101.3.4.1.1": "aes-128-ecb",
 "2.16.840.1.101.3.4.1.2": "aes-128-cbc",
 "2.16.840.1.101.3.4.1.3": "aes-128-ofb",
@@ -50814,7 +50857,7 @@ module.exports={"2.16.840.1.101.3.4.1.1": "aes-128-ecb",
 "2.16.840.1.101.3.4.1.43": "aes-256-ofb",
 "2.16.840.1.101.3.4.1.44": "aes-256-cfb"
 }
-},{}],232:[function(require,module,exports){
+},{}],238:[function(require,module,exports){
 // from https://github.com/indutny/self-signed/blob/gh-pages/lib/asn1.js
 // Fedor, you are amazing.
 
@@ -50933,7 +50976,7 @@ exports.signature = asn1.define('signature', function () {
   )
 })
 
-},{"asn1.js":135}],233:[function(require,module,exports){
+},{"asn1.js":141}],239:[function(require,module,exports){
 (function (Buffer){
 // adapted from https://github.com/apatil/pemstrip
 var findProc = /Proc-Type: 4,ENCRYPTED\r?\nDEK-Info: AES-((?:128)|(?:192)|(?:256))-CBC,([0-9A-H]+)\r?\n\r?\n([0-9A-z\n\r\+\/\=]+)\r?\n/m
@@ -50967,7 +51010,7 @@ module.exports = function (okey, password) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"browserify-aes":156,"buffer":179,"evp_bytestokey":217}],234:[function(require,module,exports){
+},{"browserify-aes":162,"buffer":185,"evp_bytestokey":223}],240:[function(require,module,exports){
 (function (Buffer){
 var asn1 = require('./asn1')
 var aesid = require('./aesid.json')
@@ -51072,7 +51115,7 @@ function decrypt (data, password) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"./aesid.json":231,"./asn1":232,"./fixProc":233,"browserify-aes":156,"buffer":179,"pbkdf2":235}],235:[function(require,module,exports){
+},{"./aesid.json":237,"./asn1":238,"./fixProc":239,"browserify-aes":162,"buffer":185,"pbkdf2":241}],241:[function(require,module,exports){
 (function (Buffer){
 var createHmac = require('create-hmac')
 var MAX_ALLOC = Math.pow(2, 30) - 1 // default in iojs
@@ -51156,9 +51199,9 @@ function pbkdf2Sync (password, salt, iterations, keylen, digest) {
 }
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179,"create-hmac":187}],236:[function(require,module,exports){
-arguments[4][115][0].apply(exports,arguments)
-},{"_process":237,"dup":115}],237:[function(require,module,exports){
+},{"buffer":185,"create-hmac":193}],242:[function(require,module,exports){
+arguments[4][120][0].apply(exports,arguments)
+},{"_process":243,"dup":120}],243:[function(require,module,exports){
 // shim for using process in browser
 
 var process = module.exports = {};
@@ -51251,7 +51294,7 @@ process.chdir = function (dir) {
 };
 process.umask = function() { return 0; };
 
-},{}],238:[function(require,module,exports){
+},{}],244:[function(require,module,exports){
 exports.publicEncrypt = require('./publicEncrypt');
 exports.privateDecrypt = require('./privateDecrypt');
 
@@ -51262,7 +51305,7 @@ exports.privateEncrypt = function privateEncrypt(key, buf) {
 exports.publicDecrypt = function publicDecrypt(key, buf) {
   return exports.privateDecrypt(key, buf, true);
 };
-},{"./privateDecrypt":240,"./publicEncrypt":241}],239:[function(require,module,exports){
+},{"./privateDecrypt":246,"./publicEncrypt":247}],245:[function(require,module,exports){
 (function (Buffer){
 var createHash = require('create-hash');
 module.exports = function (seed, len) {
@@ -51281,7 +51324,7 @@ function i2ops(c) {
   return out;
 }
 }).call(this,require("buffer").Buffer)
-},{"buffer":179,"create-hash":184}],240:[function(require,module,exports){
+},{"buffer":185,"create-hash":190}],246:[function(require,module,exports){
 (function (Buffer){
 var parseKeys = require('parse-asn1');
 var mgf = require('./mgf');
@@ -51392,7 +51435,7 @@ function compare(a, b){
   return dif;
 }
 }).call(this,require("buffer").Buffer)
-},{"./mgf":239,"./withPublic":242,"./xor":243,"bn.js":151,"browserify-rsa":172,"buffer":179,"create-hash":184,"parse-asn1":234}],241:[function(require,module,exports){
+},{"./mgf":245,"./withPublic":248,"./xor":249,"bn.js":157,"browserify-rsa":178,"buffer":185,"create-hash":190,"parse-asn1":240}],247:[function(require,module,exports){
 (function (Buffer){
 var parseKeys = require('parse-asn1');
 var randomBytes = require('randombytes');
@@ -51490,7 +51533,7 @@ function nonZero(len, crypto) {
   return out;
 }
 }).call(this,require("buffer").Buffer)
-},{"./mgf":239,"./withPublic":242,"./xor":243,"bn.js":151,"browserify-rsa":172,"buffer":179,"create-hash":184,"parse-asn1":234,"randombytes":244}],242:[function(require,module,exports){
+},{"./mgf":245,"./withPublic":248,"./xor":249,"bn.js":157,"browserify-rsa":178,"buffer":185,"create-hash":190,"parse-asn1":240,"randombytes":250}],248:[function(require,module,exports){
 (function (Buffer){
 var bn = require('bn.js');
 function withPublic(paddedMsg, key) {
@@ -51503,7 +51546,7 @@ function withPublic(paddedMsg, key) {
 
 module.exports = withPublic;
 }).call(this,require("buffer").Buffer)
-},{"bn.js":151,"buffer":179}],243:[function(require,module,exports){
+},{"bn.js":157,"buffer":185}],249:[function(require,module,exports){
 module.exports = function xor(a, b) {
   var len = a.length;
   var i = -1;
@@ -51512,7 +51555,7 @@ module.exports = function xor(a, b) {
   }
   return a
 };
-},{}],244:[function(require,module,exports){
+},{}],250:[function(require,module,exports){
 (function (process,global,Buffer){
 'use strict'
 
@@ -51551,10 +51594,10 @@ function randomBytes (size, cb) {
 }
 
 }).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {},require("buffer").Buffer)
-},{"_process":237,"buffer":179}],245:[function(require,module,exports){
+},{"_process":243,"buffer":185}],251:[function(require,module,exports){
 module.exports = require("./lib/_stream_duplex.js")
 
-},{"./lib/_stream_duplex.js":246}],246:[function(require,module,exports){
+},{"./lib/_stream_duplex.js":252}],252:[function(require,module,exports){
 // a duplex stream is just a stream that is both readable and writable.
 // Since JS doesn't have multiple prototypal inheritance, this class
 // prototypally inherits from Readable, and then parasitically from
@@ -51638,7 +51681,7 @@ function forEach (xs, f) {
   }
 }
 
-},{"./_stream_readable":248,"./_stream_writable":250,"core-util-is":182,"inherits":226,"process-nextick-args":236}],247:[function(require,module,exports){
+},{"./_stream_readable":254,"./_stream_writable":256,"core-util-is":188,"inherits":232,"process-nextick-args":242}],253:[function(require,module,exports){
 // a passthrough stream.
 // basically just the most minimal sort of Transform stream.
 // Every written chunk gets output as-is.
@@ -51667,7 +51710,7 @@ PassThrough.prototype._transform = function(chunk, encoding, cb) {
   cb(null, chunk);
 };
 
-},{"./_stream_transform":249,"core-util-is":182,"inherits":226}],248:[function(require,module,exports){
+},{"./_stream_transform":255,"core-util-is":188,"inherits":232}],254:[function(require,module,exports){
 (function (process){
 'use strict';
 
@@ -52646,7 +52689,7 @@ function indexOf (xs, x) {
 }
 
 }).call(this,require('_process'))
-},{"./_stream_duplex":246,"_process":237,"buffer":179,"core-util-is":182,"events":216,"inherits":226,"isarray":228,"process-nextick-args":236,"string_decoder/":265,"util":153}],249:[function(require,module,exports){
+},{"./_stream_duplex":252,"_process":243,"buffer":185,"core-util-is":188,"events":222,"inherits":232,"isarray":234,"process-nextick-args":242,"string_decoder/":271,"util":159}],255:[function(require,module,exports){
 // a transform stream is a readable/writable stream where you do
 // something with the data.  Sometimes it's called a "filter",
 // but that's not a great name for it, since that implies a thing where
@@ -52845,7 +52888,7 @@ function done(stream, er) {
   return stream.push(null);
 }
 
-},{"./_stream_duplex":246,"core-util-is":182,"inherits":226}],250:[function(require,module,exports){
+},{"./_stream_duplex":252,"core-util-is":188,"inherits":232}],256:[function(require,module,exports){
 // A bit simpler than readable streams.
 // Implement an async ._write(chunk, encoding, cb), and it'll handle all
 // the drain event emission and buffering.
@@ -53376,18 +53419,18 @@ function endWritable(stream, state, cb) {
   state.ended = true;
 }
 
-},{"./_stream_duplex":246,"buffer":179,"core-util-is":182,"events":216,"inherits":226,"process-nextick-args":236,"util-deprecate":267}],251:[function(require,module,exports){
+},{"./_stream_duplex":252,"buffer":185,"core-util-is":188,"events":222,"inherits":232,"process-nextick-args":242,"util-deprecate":273}],257:[function(require,module,exports){
 module.exports = require("./lib/_stream_passthrough.js")
 
-},{"./lib/_stream_passthrough.js":247}],252:[function(require,module,exports){
-arguments[4][123][0].apply(exports,arguments)
-},{"./lib/_stream_duplex.js":246,"./lib/_stream_passthrough.js":247,"./lib/_stream_readable.js":248,"./lib/_stream_transform.js":249,"./lib/_stream_writable.js":250,"dup":123}],253:[function(require,module,exports){
+},{"./lib/_stream_passthrough.js":253}],258:[function(require,module,exports){
+arguments[4][128][0].apply(exports,arguments)
+},{"./lib/_stream_duplex.js":252,"./lib/_stream_passthrough.js":253,"./lib/_stream_readable.js":254,"./lib/_stream_transform.js":255,"./lib/_stream_writable.js":256,"dup":128}],259:[function(require,module,exports){
 module.exports = require("./lib/_stream_transform.js")
 
-},{"./lib/_stream_transform.js":249}],254:[function(require,module,exports){
+},{"./lib/_stream_transform.js":255}],260:[function(require,module,exports){
 module.exports = require("./lib/_stream_writable.js")
 
-},{"./lib/_stream_writable.js":250}],255:[function(require,module,exports){
+},{"./lib/_stream_writable.js":256}],261:[function(require,module,exports){
 (function (Buffer){
 /*
 CryptoJS v3.1.2
@@ -53601,7 +53644,7 @@ function ripemd160 (message) {
 module.exports = ripemd160
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179}],256:[function(require,module,exports){
+},{"buffer":185}],262:[function(require,module,exports){
 (function (Buffer){
 // prototype class for hash functions
 function Hash (blockSize, finalSize) {
@@ -53674,7 +53717,7 @@ Hash.prototype._update = function () {
 module.exports = Hash
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":179}],257:[function(require,module,exports){
+},{"buffer":185}],263:[function(require,module,exports){
 var exports = module.exports = function SHA (algorithm) {
   algorithm = algorithm.toLowerCase()
 
@@ -53691,7 +53734,7 @@ exports.sha256 = require('./sha256')
 exports.sha384 = require('./sha384')
 exports.sha512 = require('./sha512')
 
-},{"./sha":258,"./sha1":259,"./sha224":260,"./sha256":261,"./sha384":262,"./sha512":263}],258:[function(require,module,exports){
+},{"./sha":264,"./sha1":265,"./sha224":266,"./sha256":267,"./sha384":268,"./sha512":269}],264:[function(require,module,exports){
 (function (Buffer){
 /*
  * A JavaScript implementation of the Secure Hash Algorithm, SHA-0, as defined
@@ -53795,7 +53838,7 @@ module.exports = Sha
 
 
 }).call(this,require("buffer").Buffer)
-},{"./hash":256,"buffer":179,"inherits":226}],259:[function(require,module,exports){
+},{"./hash":262,"buffer":185,"inherits":232}],265:[function(require,module,exports){
 (function (Buffer){
 /*
  * A JavaScript implementation of the Secure Hash Algorithm, SHA-1, as defined
@@ -53895,7 +53938,7 @@ Sha1.prototype._hash = function () {
 module.exports = Sha1
 
 }).call(this,require("buffer").Buffer)
-},{"./hash":256,"buffer":179,"inherits":226}],260:[function(require,module,exports){
+},{"./hash":262,"buffer":185,"inherits":232}],266:[function(require,module,exports){
 (function (Buffer){
 /**
  * A JavaScript implementation of the Secure Hash Algorithm, SHA-256, as defined
@@ -53951,7 +53994,7 @@ Sha224.prototype._hash = function () {
 module.exports = Sha224
 
 }).call(this,require("buffer").Buffer)
-},{"./hash":256,"./sha256":261,"buffer":179,"inherits":226}],261:[function(require,module,exports){
+},{"./hash":262,"./sha256":267,"buffer":185,"inherits":232}],267:[function(require,module,exports){
 (function (Buffer){
 /**
  * A JavaScript implementation of the Secure Hash Algorithm, SHA-256, as defined
@@ -54096,7 +54139,7 @@ Sha256.prototype._hash = function () {
 module.exports = Sha256
 
 }).call(this,require("buffer").Buffer)
-},{"./hash":256,"buffer":179,"inherits":226}],262:[function(require,module,exports){
+},{"./hash":262,"buffer":185,"inherits":232}],268:[function(require,module,exports){
 (function (Buffer){
 var inherits = require('inherits')
 var SHA512 = require('./sha512')
@@ -54156,7 +54199,7 @@ Sha384.prototype._hash = function () {
 module.exports = Sha384
 
 }).call(this,require("buffer").Buffer)
-},{"./hash":256,"./sha512":263,"buffer":179,"inherits":226}],263:[function(require,module,exports){
+},{"./hash":262,"./sha512":269,"buffer":185,"inherits":232}],269:[function(require,module,exports){
 (function (Buffer){
 var inherits = require('inherits')
 var Hash = require('./hash')
@@ -54426,7 +54469,7 @@ Sha512.prototype._hash = function () {
 module.exports = Sha512
 
 }).call(this,require("buffer").Buffer)
-},{"./hash":256,"buffer":179,"inherits":226}],264:[function(require,module,exports){
+},{"./hash":262,"buffer":185,"inherits":232}],270:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -54555,9 +54598,9 @@ Stream.prototype.pipe = function(dest, options) {
   return dest;
 };
 
-},{"events":216,"inherits":226,"readable-stream/duplex.js":245,"readable-stream/passthrough.js":251,"readable-stream/readable.js":252,"readable-stream/transform.js":253,"readable-stream/writable.js":254}],265:[function(require,module,exports){
-arguments[4][131][0].apply(exports,arguments)
-},{"buffer":179,"dup":131}],266:[function(require,module,exports){
+},{"events":222,"inherits":232,"readable-stream/duplex.js":251,"readable-stream/passthrough.js":257,"readable-stream/readable.js":258,"readable-stream/transform.js":259,"readable-stream/writable.js":260}],271:[function(require,module,exports){
+arguments[4][136][0].apply(exports,arguments)
+},{"buffer":185,"dup":136}],272:[function(require,module,exports){
 var nextTick = require('process/browser.js').nextTick;
 var apply = Function.prototype.apply;
 var slice = Array.prototype.slice;
@@ -54634,16 +54677,16 @@ exports.setImmediate = typeof setImmediate === "function" ? setImmediate : funct
 exports.clearImmediate = typeof clearImmediate === "function" ? clearImmediate : function(id) {
   delete immediateIds[id];
 };
-},{"process/browser.js":237}],267:[function(require,module,exports){
-arguments[4][132][0].apply(exports,arguments)
-},{"dup":132}],268:[function(require,module,exports){
+},{"process/browser.js":243}],273:[function(require,module,exports){
+arguments[4][137][0].apply(exports,arguments)
+},{"dup":137}],274:[function(require,module,exports){
 module.exports = function isBuffer(arg) {
   return arg && typeof arg === 'object'
     && typeof arg.copy === 'function'
     && typeof arg.fill === 'function'
     && typeof arg.readUInt8 === 'function';
 }
-},{}],269:[function(require,module,exports){
+},{}],275:[function(require,module,exports){
 (function (process,global){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -55233,7 +55276,7 @@ function hasOwnProperty(obj, prop) {
 }
 
 }).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./support/isBuffer":268,"_process":237,"inherits":226}],270:[function(require,module,exports){
+},{"./support/isBuffer":274,"_process":243,"inherits":232}],276:[function(require,module,exports){
 var indexOf = require('indexof');
 
 var Object_keys = function (obj) {
@@ -55373,5 +55416,5 @@ exports.createContext = Script.createContext = function (context) {
     return copy;
 };
 
-},{"indexof":225}]},{},[1])(1)
+},{"indexof":231}]},{},[140])(140)
 });
