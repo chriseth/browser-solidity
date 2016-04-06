@@ -1,3 +1,4 @@
+soljson-v0.3.1-2016-04-05-12797ed.js
 soljson-v0.3.1-2016-03-31-c67926c.js
 soljson-v0.3.1-2016-03-31-c492d9b.js
 soljson-v0.3.0-2016-03-30-c2cf806.js
