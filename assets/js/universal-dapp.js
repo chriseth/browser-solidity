@@ -24,6 +24,14 @@ function UniversalDApp (contracts, options) {
 
 }
 
+UniversalDApp.prototype.newAccount = function () {
+    var privateKey;
+    do {
+        privateKey = crypto.randomBytes(32);
+    } while (!EthJS.Util.isValidPrivate(privateKey));
+    this.addAccount(privateKey);
+};
+
 UniversalDApp.prototype.addAccount = function (privateKey, balance) {
     if (this.accounts) {
         privateKey = new Buffer(privateKey, 'hex')
