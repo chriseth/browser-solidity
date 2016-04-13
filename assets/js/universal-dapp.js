@@ -227,6 +227,28 @@ UniversalDApp.prototype.getCallButton = function(args) {
         inputs += inp.type + ' ' + inp.name;
     });
     var inputField = $('<input/>').attr('placeholder', inputs).attr('title', inputs);
+    var valueButton = $('<button class="valueButton"><i class="fa fa-money"/></button>');
+    var etherValue = 0;
+    valueButton.click(function() {
+        var newEtherValue = window.prompt(
+            "How much Ether do you want to send\n" +
+            "together with this call?\n\n" +
+            "E.g. \"1.5\" or \"10 ether\" or \"100 finney\"",
+            etherValue);
+        try {
+            var comp = newEtherValue.split(' ');
+            args.value = web3.toWei(comp[0], comp.slice(1).join(' '));
+        } catch (e) {
+            window.alert("Invalid value.");
+            return;
+        }
+        etherValue = newEtherValue;
+        if (etherValue !== '' && etherValue !== '0')
+            valueButton.addClass("active");
+        else
+            valueButton.removeClass("active");
+        valueButton.attr('title', etherValue);
+    });
     var $outputOverride = $('<div class="value" />');
     var outputSpan = $('<div class="output"/>');
 
@@ -365,8 +387,11 @@ UniversalDApp.prototype.getCallButton = function(args) {
         .toggleClass( 'constant', !isConstructor && args.abi.constant )
         .toggleClass( 'hasArgs', args.abi.inputs.length > 0)
         .toggleClass( 'constructor', isConstructor)
-        .append(button)
-        .append( (lookupOnly && !inputs.length) ? $outputOverride : inputField );
+        .append(button);
+    if (lookupOnly && !inputs.length)
+        $contractProperty.append($outputOverride);
+    else
+        $contractProperty.append(inputField).append(valueButton);
     return $contractProperty.append(outputSpan);
 }
 
@@ -431,7 +456,7 @@ UniversalDApp.prototype.runTx = function( data, args, cb) {
         data = '0x' + data;
 
     var gas = self.options.getGas ? self.options.getGas : 1000000;
-    var value = self.options.getValue ? self.options.getValue : 0;
+    var value = (args.value || (self.options.getValue ? self.options.getValue : 0)) - 0;
     
     if (!this.vm) {
         var tx = {
