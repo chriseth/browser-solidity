@@ -55,7 +55,18 @@ UniversalDApp.prototype._addAccount = function (privateKey, balance) {
 
 UniversalDApp.prototype.getAccounts = function (cb) {
     if (!this.vm) {
-        web3.personal.listAccounts(cb);
+        // TOOD: remove the try/catch if this is fixed: https://github.com/ethereum/web3.js/issues/442
+        try {
+            web3.personal.listAccounts(function (err, res) {
+                if (err) {
+                    web3.eth.getAccounts(cb);
+                } else {
+                    cb(err, res);
+                }
+            });
+        } catch (e) {
+            web3.eth.getAccounts(cb);
+        }
     } else {
         if (!this.accounts) return cb("No accounts?");
 
