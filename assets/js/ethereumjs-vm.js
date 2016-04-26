@@ -10514,7 +10514,7 @@ module.exports={
   "_args": [
     [
       "elliptic@^6.2.3",
-      "/Users/alex/Projects/ethereumjs/browser-builds2/node_modules/secp256k1"
+      "/Users/alex/Projects/ethereumjs/browser-builds/node_modules/secp256k1"
     ]
   ],
   "_from": "elliptic@>=6.2.3 <7.0.0",
@@ -10544,7 +10544,7 @@ module.exports={
   "_shasum": "18e46d7306b0951275a2d42063270a14b74ebe99",
   "_shrinkwrap": null,
   "_spec": "elliptic@^6.2.3",
-  "_where": "/Users/alex/Projects/ethereumjs/browser-builds2/node_modules/secp256k1",
+  "_where": "/Users/alex/Projects/ethereumjs/browser-builds/node_modules/secp256k1",
   "author": {
     "email": "fedor@indutny.com",
     "name": "Fedor Indutny"
@@ -10569,7 +10569,7 @@ module.exports={
   "directories": {},
   "dist": {
     "shasum": "18e46d7306b0951275a2d42063270a14b74ebe99",
-    "tarball": "http://registry.npmjs.org/elliptic/-/elliptic-6.2.3.tgz"
+    "tarball": "https://registry.npmjs.org/elliptic/-/elliptic-6.2.3.tgz"
   },
   "files": [
     "lib"
@@ -11316,14 +11316,14 @@ function elementaryName (name) {
   return name
 }
 
-function eventID (name, types) {
+ABI.eventID = function (name, types) {
   // FIXME: use node.js util.format?
   var sig = name + '(' + types.map(elementaryName).join(',') + ')'
   return utils.sha3(new Buffer(sig))
 }
 
-function methodID (name, types) {
-  return eventID(name, types).slice(0, 4)
+ABI.methodID = function (name, types) {
+  return ABI.eventID(name, types).slice(0, 4)
 }
 
 // Parse N from type<N>
@@ -11365,10 +11365,34 @@ function parseNumber (arg) {
   }
 }
 
+// someMethod(bytes,uint)
+// someMethod(bytes,uint):(boolean)
+function parseSignature (sig) {
+  var tmp = /^(\w+)\((.+)\)$/.exec(sig)
+  if (tmp.length !== 3) {
+    throw new Error('Invalid method signature')
+  }
+
+  var args = /^(.+)\):\((.+)$/.exec(tmp[2])
+
+  if (args !== null && args.length === 3) {
+    return {
+      method: tmp[1],
+      args: args[1].split(','),
+      retargs: args[2].split(',')
+    }
+  } else {
+    return {
+      method: tmp[1],
+      args: tmp[2].split(',')
+    }
+  }
+}
+
 // Encodes a single item (can be dynamic array)
 // @returns: Buffer
 function encodeSingle (type, arg) {
-  var size, num
+  var size, num, ret, i
 
   if (type === 'address') {
     return encodeSingle('uint160', parseNumber(arg))
@@ -11376,8 +11400,8 @@ function encodeSingle (type, arg) {
     return encodeSingle('uint8', arg ? 1 : 0)
   } else if (type === 'string') {
     return encodeSingle('bytes', utf8.encode(arg))
-  } else if (type.match(/\w+\[\d*\]/)) {
-    // this part handles variable length ([]) and fixed-length arrays ([2])
+  } else if (type.match(/\w+\[\d+\]/)) {
+    // this part handles fixed-length arrays ([2])
     // NOTE: we catch here all calls to arrays, that simplifies the rest
     if (typeof arg.length === 'undefined') {
       throw new Error('Not an array?')
@@ -11390,8 +11414,23 @@ function encodeSingle (type, arg) {
 
     type = type.slice(0, type.indexOf('['))
 
-    var ret = [ encodeSingle('uint256', arg.length) ]
-    for (var i in arg) {
+    ret = []
+    for (i in arg) {
+      ret.push(encodeSingle(type, arg[i]))
+    }
+
+    return Buffer.concat(ret)
+  } else if (type.match(/\w+\[\]/)) {
+    // this part handles variable length ([])
+    // NOTE: we catch here all calls to arrays, that simplifies the rest
+    if (typeof arg.length === 'undefined') {
+      throw new Error('Not an array?')
+    }
+
+    type = type.slice(0, type.indexOf('['))
+
+    ret = [ encodeSingle('uint256', arg.length) ]
+    for (i in arg) {
       ret.push(encodeSingle(type, arg[i]))
     }
 
@@ -11440,7 +11479,7 @@ function encodeSingle (type, arg) {
 // @returns: array
 // FIXME: this method will need a lot of attention at checking limits and validation
 function decodeSingle (type, arg) {
-  var size, num
+  var size, num, ret, i
 
   if (type === 'address') {
     return decodeSingle('uint160', arg)
@@ -11448,18 +11487,26 @@ function decodeSingle (type, arg) {
     return decodeSingle('uint8', arg).toString() === new BN(1).toString()
   } else if (type === 'string') {
     return utf8.decode(decodeSingle('bytes', arg).toString())
-  } else if (type.match(/\w+\[\d*\]/)) {
-    // this part handles variable length ([]) and fixed-length arrays ([2])
+  } else if (type.match(/\w+\[\d+\]/)) {
+    // this part handles fixed-length arrays ([2])
     // NOTE: we catch here all calls to arrays, that simplifies the rest
     size = parseTypeArray(type)
     type = type.slice(0, type.indexOf('['))
-    var count = decodeSingle('uint256', arg.slice(0, 32)).toNumber()
-    if ((size !== 0) && (count > size)) {
-      throw new Error('Elements exceed array size: ' + size)
+
+    ret = []
+    for (i = 0; i < size; i++) {
+      ret.push(decodeSingle(type, arg.slice(i * 32)))
     }
 
-    var ret = []
-    for (var i = 1; i < count + 1; i++) {
+    return ret
+  } else if (type.match(/\w+\[\]/)) {
+    // this part handles variable length ([])
+    // NOTE: we catch here all calls to arrays, that simplifies the rest
+    type = type.slice(0, type.indexOf('['))
+    var count = decodeSingle('uint256', arg.slice(0, 32)).toNumber()
+
+    ret = []
+    for (i = 1; i < count + 1; i++) {
       ret.push(decodeSingle(type, arg.slice(i * 32)))
     }
 
@@ -11507,72 +11554,44 @@ function decodeSingle (type, arg) {
 // Is a type dynamic?
 function isDynamic (type) {
   // FIXME: handle all types? I don't think anything is missing now
-  return (type === 'string') || (type === 'bytes') || type.match(/\w+\[\d*\]/)
+  return (type === 'string') || (type === 'bytes') || type.match(/\w+\[\]/)
 }
 
 // Encode a method/event with arguments
 // @types an array of string type names
 // @args  an array of the appropriate values
-ABI.rawEncode = function (name, types, args) {
-  var output = new Buffer(0)
-  var data = new Buffer(0)
+ABI.rawEncode = function (types, values) {
+  var output = []
+  var data = []
 
-  function pushOutput (tmp) {
-    output = Buffer.concat([ output, tmp ])
-  }
-
-  function pushData (tmp) {
-    data = Buffer.concat([ data, tmp ])
-  }
-
-  if (name !== null) {
-    pushOutput(methodID(name, types))
-  }
-
-  const headLength = 32 * types.length
+  var headLength = 32 * types.length
 
   for (var i in types) {
     var type = elementaryName(types[i])
-    var arg = args[i]
-    var cur = encodeSingle(type, arg)
+    var value = values[i]
+    var cur = encodeSingle(type, value)
 
     // Use the head/tail method for storing dynamic data
     if (isDynamic(type)) {
-      pushOutput(encodeSingle('uint256', headLength + data.length))
-      pushData(cur)
+      output.push(encodeSingle('uint256', headLength))
+      data.push(cur)
+      headLength += cur.length
     } else {
-      pushOutput(cur)
+      output.push(cur)
     }
   }
 
-  pushOutput(data)
-  return output
+  return Buffer.concat(output.concat(data))
 }
 
-ABI.rawEncodeResponse = function (types, args) {
-  return ABI.rawEncode(null, types, args)
-}
-
-ABI.encode = function (abiDefinition, request, args) {
-  throw new Error('Not implemented')
-}
-
-ABI.rawDecode = function (name, intypes, outtypes, data) {
+ABI.rawDecode = function (types, data) {
   var ret = []
 
   data = new Buffer(data)
 
-  // Validate if signature matches
-  if (name !== null) {
-    if (methodID(name, intypes).toString('hex') !== data.slice(0, 4).toString('hex')) {
-      throw new Error('Invalid method signature')
-    }
-    data = data.slice(4)
-  }
-
   var offset = 0
-  for (var i in outtypes) {
-    var type = elementaryName(outtypes[i])
+  for (var i in types) {
+    var type = elementaryName(types[i])
     var cur = data.slice(offset, offset + 32)
 
     if (isDynamic(type)) {
@@ -11582,23 +11601,67 @@ ABI.rawDecode = function (name, intypes, outtypes, data) {
         throw new Error('Invalid offset: ' + dataOffset)
       }
 
-      var tmp = decodeSingle(type, data.slice(dataOffset))
-      if (typeof tmp === Array) {
-        ret = ret.concat(tmp)
-      } else {
-        ret.push(tmp)
-      }
-    } else {
-      ret.push(decodeSingle(type, cur))
+      cur = data.slice(dataOffset)
     }
+
+    ret.push(decodeSingle(type, cur))
     offset += 32
   }
 
   return ret
 }
 
-ABI.decode = function (abiDefinition, request, data) {
-  throw new Error('Not implemented')
+ABI.simpleEncode = function (method) {
+  var args = Array.prototype.slice.call(arguments).slice(1)
+  var sig = parseSignature(method)
+
+  // FIXME: validate/convert arguments
+  if (args.length !== sig.args.length) {
+    throw new Error('Argument count mismatch')
+  }
+
+  return Buffer.concat([ ABI.methodID(sig.method, sig.args), ABI.rawEncode(sig.args, args) ])
+}
+
+ABI.simpleDecode = function (method, data) {
+  var sig = parseSignature(method)
+
+  // FIXME: validate/convert arguments
+  if (!sig.retargs) {
+    throw new Error('No return values in method')
+  }
+
+  return ABI.rawDecode(sig.retargs, data)
+}
+
+function stringify (type, value) {
+  if (type.startsWith('address') || type.startsWith('bytes')) {
+    return '0x' + value.toString('hex')
+  } else {
+    return value.toString()
+  }
+}
+
+ABI.stringify = function (types, values) {
+  var ret = []
+
+  for (var i in types) {
+    var type = types[i]
+    var value = values[i]
+
+    // if it is an array type, concat the items
+    if (/^[^\[]+\[.*\]$/.test(type)) {
+      value = value.map(function (item) {
+        return stringify(type, item)
+      }).join(', ')
+    } else {
+      value = stringify(type, value)
+    }
+
+    ret.push(value)
+  }
+
+  return ret
 }
 
 ABI.solidityPack = function (types, values) {
@@ -21901,7 +21964,7 @@ exports.isValidPrivate = function (privateKey) {
  * Accepts "Ethereum public keys" and SEC1 encoded keys.
  * @method publicToAddress
  * @param {Buffer} pubKey The two points of an uncompressed key, unless sanitize is enabled
- * @param {Boolean} sanitize Accept public keys in other formats
+ * @param {Boolean} [sanitize=false] Accept public keys in other formats
  * @return {Buffer}
  */
 exports.pubToAddress = exports.publicToAddress = function (pubKey, sanitize) {
@@ -27705,9 +27768,9 @@ module.exports = Array.isArray || function (arr) {
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 },{}],84:[function(require,module,exports){
-module.exports = require('sha3').SHA3Hash
+module.exports = require('browserify-sha3').SHA3Hash
 
-},{"sha3":13}],85:[function(require,module,exports){
+},{"browserify-sha3":13}],85:[function(require,module,exports){
 var encodings = require('./lib/encodings');
 
 module.exports = Codec;
@@ -29766,6 +29829,7 @@ function endWritable(stream, state, cb) {
 
 }).call(this,require('_process'))
 },{"./_stream_duplex":89,"_process":246,"buffer":188,"core-util-is":14,"inherits":81,"stream":273}],94:[function(require,module,exports){
+(function (process){
 exports = module.exports = require('./lib/_stream_readable.js');
 exports.Stream = require('stream');
 exports.Readable = exports;
@@ -29773,8 +29837,12 @@ exports.Writable = require('./lib/_stream_writable.js');
 exports.Duplex = require('./lib/_stream_duplex.js');
 exports.Transform = require('./lib/_stream_transform.js');
 exports.PassThrough = require('./lib/_stream_passthrough.js');
+if (!process.browser && process.env.READABLE_STREAM === 'disable') {
+  module.exports = require('stream');
+}
 
-},{"./lib/_stream_duplex.js":89,"./lib/_stream_passthrough.js":90,"./lib/_stream_readable.js":91,"./lib/_stream_transform.js":92,"./lib/_stream_writable.js":93,"stream":273}],95:[function(require,module,exports){
+}).call(this,require('_process'))
+},{"./lib/_stream_duplex.js":89,"./lib/_stream_passthrough.js":90,"./lib/_stream_readable.js":91,"./lib/_stream_transform.js":92,"./lib/_stream_writable.js":93,"_process":246,"stream":273}],95:[function(require,module,exports){
 arguments[4][6][0].apply(exports,arguments)
 },{"dup":6}],96:[function(require,module,exports){
 (function (process){
@@ -31526,6 +31594,7 @@ function endWritable(stream, state, cb) {
 
 }).call(this,require('_process'))
 },{"./_stream_duplex":97,"_process":246,"buffer":188,"core-util-is":14,"inherits":81,"stream":273}],102:[function(require,module,exports){
+(function (process){
 var Stream = require('stream'); // hack to fix a circular dependency issue when used with browserify
 exports = module.exports = require('./lib/_stream_readable.js');
 exports.Stream = Stream;
@@ -31534,8 +31603,12 @@ exports.Writable = require('./lib/_stream_writable.js');
 exports.Duplex = require('./lib/_stream_duplex.js');
 exports.Transform = require('./lib/_stream_transform.js');
 exports.PassThrough = require('./lib/_stream_passthrough.js');
+if (!process.browser && process.env.READABLE_STREAM === 'disable') {
+  module.exports = require('stream');
+}
 
-},{"./lib/_stream_duplex.js":97,"./lib/_stream_passthrough.js":98,"./lib/_stream_readable.js":99,"./lib/_stream_transform.js":100,"./lib/_stream_writable.js":101,"stream":273}],103:[function(require,module,exports){
+}).call(this,require('_process'))
+},{"./lib/_stream_duplex.js":97,"./lib/_stream_passthrough.js":98,"./lib/_stream_readable.js":99,"./lib/_stream_transform.js":100,"./lib/_stream_writable.js":101,"_process":246,"stream":273}],103:[function(require,module,exports){
 /* Copyright (c) 2012-2015 LevelUP contributors
  * See list at <https://github.com/level/levelup#contributing>
  * MIT License
@@ -32109,7 +32182,7 @@ module.exports={
   "_args": [
     [
       "levelup@^1.2.1",
-      "/Users/alex/Projects/ethereumjs/browser-builds2/node_modules/merkle-patricia-tree"
+      "/Users/alex/Projects/ethereumjs/browser-builds/node_modules/merkle-patricia-tree"
     ]
   ],
   "_from": "levelup@>=1.2.1 <2.0.0",
@@ -32139,7 +32212,7 @@ module.exports={
   "_shasum": "8030758bb1b1dafdb71bfb55fff0caa2740cb846",
   "_shrinkwrap": null,
   "_spec": "levelup@^1.2.1",
-  "_where": "/Users/alex/Projects/ethereumjs/browser-builds2/node_modules/merkle-patricia-tree",
+  "_where": "/Users/alex/Projects/ethereumjs/browser-builds/node_modules/merkle-patricia-tree",
   "browser": {
     "leveldown": false,
     "leveldown/package": false,
@@ -35325,7 +35398,6 @@ function done(stream, er) {
   return stream.push(null);
 }
 },{"./_stream_duplex":124,"core-util-is":14,"inherits":81}],128:[function(require,module,exports){
-(function (process){
 // A bit simpler than readable streams.
 // Implement an async ._write(chunk, encoding, cb), and it'll handle all
 // the drain event emission and buffering.
@@ -35339,7 +35411,7 @@ var processNextTick = require('process-nextick-args');
 /*</replacement>*/
 
 /*<replacement>*/
-var asyncWrite = !process.browser && ['v0.10', 'v0.9.'].indexOf(process.version.slice(0, 5)) > -1 ? setImmediate : processNextTick;
+var asyncWrite = !true ? setImmediate : processNextTick;
 /*</replacement>*/
 
 /*<replacement>*/
@@ -35842,8 +35914,7 @@ function CorkedRequest(state) {
     }
   };
 }
-}).call(this,require('_process'))
-},{"./_stream_duplex":124,"_process":246,"buffer":188,"core-util-is":14,"events":225,"inherits":81,"process-nextick-args":122,"util-deprecate":140}],129:[function(require,module,exports){
+},{"./_stream_duplex":124,"buffer":188,"core-util-is":14,"events":225,"inherits":81,"process-nextick-args":122,"util-deprecate":140}],129:[function(require,module,exports){
 var toString = {}.toString;
 
 module.exports = Array.isArray || function (arr) {
@@ -35864,7 +35935,13 @@ exports.Duplex = require('./lib/_stream_duplex.js');
 exports.Transform = require('./lib/_stream_transform.js');
 exports.PassThrough = require('./lib/_stream_passthrough.js');
 
-},{"./lib/_stream_duplex.js":124,"./lib/_stream_passthrough.js":125,"./lib/_stream_readable.js":126,"./lib/_stream_transform.js":127,"./lib/_stream_writable.js":128}],131:[function(require,module,exports){
+// inline-process-browser and unreachable-branch-transform make sure this is
+// removed in browserify builds
+if (!true) {
+  module.exports = require('stream');
+}
+
+},{"./lib/_stream_duplex.js":124,"./lib/_stream_passthrough.js":125,"./lib/_stream_readable.js":126,"./lib/_stream_transform.js":127,"./lib/_stream_writable.js":128,"stream":273}],131:[function(require,module,exports){
 (function (Buffer){
 const assert = require('assert')
 /**
@@ -54117,8 +54194,20 @@ function endWritable(stream, state, cb) {
 module.exports = require("./lib/_stream_passthrough.js")
 
 },{"./lib/_stream_passthrough.js":256}],261:[function(require,module,exports){
-arguments[4][130][0].apply(exports,arguments)
-},{"./lib/_stream_duplex.js":255,"./lib/_stream_passthrough.js":256,"./lib/_stream_readable.js":257,"./lib/_stream_transform.js":258,"./lib/_stream_writable.js":259,"dup":130}],262:[function(require,module,exports){
+var Stream = (function (){
+  try {
+    return require('st' + 'ream'); // hack to fix a circular dependency issue when used with browserify
+  } catch(_){}
+}());
+exports = module.exports = require('./lib/_stream_readable.js');
+exports.Stream = Stream || exports;
+exports.Readable = exports;
+exports.Writable = require('./lib/_stream_writable.js');
+exports.Duplex = require('./lib/_stream_duplex.js');
+exports.Transform = require('./lib/_stream_transform.js');
+exports.PassThrough = require('./lib/_stream_passthrough.js');
+
+},{"./lib/_stream_duplex.js":255,"./lib/_stream_passthrough.js":256,"./lib/_stream_readable.js":257,"./lib/_stream_transform.js":258,"./lib/_stream_writable.js":259}],262:[function(require,module,exports){
 module.exports = require("./lib/_stream_transform.js")
 
 },{"./lib/_stream_transform.js":258}],263:[function(require,module,exports){
