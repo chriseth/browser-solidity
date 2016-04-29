@@ -1,4 +1,9 @@
 var soljsonSources = [
+  'soljson-v0.3.2-2016-04-22-dd4300d.js',
+  'soljson-v0.3.2-2016-04-18-81ae2a7.js',
+  'soljson-v0.3.1-2016-04-18-81ae2a7.js',
+  'soljson-v0.3.1-2016-04-15-7ba6c98.js',
+  'soljson-v0.3.1-2016-04-13-9137506.js',
   'soljson-v0.3.1-2016-04-12-3ad5e82.js',
   'soljson-v0.3.1-2016-04-07-054bc2a.js',
   'soljson-v0.3.1-2016-04-05-12797ed.js',
@@ -75,3 +80,20 @@ var soljsonSources = [
   'soljson-v0.1.2-2015-09-14-d0d36e3.js',
   'soljson-v0.1.1-2015-08-04-6ff4cd6.js',
 ];
+var soljsonReleases = {};
+(function() {
+  var version = '';
+  for (var i = soljsonSources.length - 1; i >= 0; --i) {
+    var thisVersion = soljsonSources[i].match(/soljson-v([0-9.]*)-.*.js/)[1];
+    if (thisVersion === version)
+      continue;
+    version = thisVersion;
+    soljsonReleases[version] = soljsonSources[i];
+  }
+})();
+
+if (typeof(module) !== 'undefined')
+  module.exports = {
+    'allVersions': soljsonSources,
+    'releases': soljsonReleases
+  };
