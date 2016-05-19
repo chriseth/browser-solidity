@@ -4,7 +4,7 @@ Browser Solidity is a browser based Solidity compiler. To use either visit [http
 
 ## Node.js Usage
 
-See [here](https://github.com/ethereum/solc-js).
+This repository has been moved to its own repository at [ethereum/solc-js](https://github.com/ethereum/solc-js).
 
 ## Usage as as Chrome Extension
 
