@@ -9,4 +9,4 @@ See [here](https://github.com/ethereum/solc-js).
 #To use it as a chrome extension:
 Browse to chrome://extensions/
 
-Make sure 'Developer mode' has been checked. Then click 'Load unpacked extension...' to pop up a file-selection dialog.
+Make sure 'Developer mode' has been checked. Then click 'Load unpacked extension...' to pop up a file-selection dialog. Select the `browser-solidity` folder, wherever it is placed on your computer.
