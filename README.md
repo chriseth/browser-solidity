@@ -1,6 +1,6 @@
 # Project has moved!
 
-The browser-solidity project has been moved to [https://ethereum.github.io/browser-solidity](https://ethereum.github.io/browser-solidity).
+The browser-solidity project has been moved to [ethereum/browser-solidity](https://github.com/ethereum/browser-solidity).
 
 ## Node.js Usage
 
