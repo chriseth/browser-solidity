@@ -13,8 +13,8 @@ function UniversalDApp (contracts, options) {
         this.stateTrie = new EthJS.Trie();
         this.vm = new EthJS.VM(this.stateTrie);
 
-        this.addAccount('3cd7232cd6f3fc66a57a6bedc1a8ed6c228fff0a327e169c2bcc5e869ed49511')
-        this.addAccount('2ac6c190b09897cd8987869cc7b918cfea07ee82038d492abce033c75c1b1d0c')
+        this._addAccount('3cd7232cd6f3fc66a57a6bedc1a8ed6c228fff0a327e169c2bcc5e869ed49511')
+        this._addAccount('2ac6c190b09897cd8987869cc7b918cfea07ee82038d492abce033c75c1b1d0c')
     } else {
         var host = options.host || "localhost";
         var port = options.port || "8545";
@@ -24,7 +24,23 @@ function UniversalDApp (contracts, options) {
 
 }
 
-UniversalDApp.prototype.addAccount = function (privateKey, balance) {
+UniversalDApp.prototype.newAccount = function (password) {
+    if (!this.vm) {
+        web3.personal.newAccount(password);
+    } else {
+        var privateKey;
+        do {
+            privateKey = crypto.randomBytes(32);
+        } while (!EthJS.Util.isValidPrivate(privateKey));
+        this._addAccount(privateKey);
+    }
+};
+
+UniversalDApp.prototype._addAccount = function (privateKey, balance) {
+    if (!this.vm) {
+        throw new Error('_addAccount() cannot be called in non-VM mode');
+    }
+
     if (this.accounts) {
         privateKey = new Buffer(privateKey, 'hex')
         var address = EthJS.Util.privateToAddress(privateKey);
@@ -39,7 +55,18 @@ UniversalDApp.prototype.addAccount = function (privateKey, balance) {
 
 UniversalDApp.prototype.getAccounts = function (cb) {
     if (!this.vm) {
-        web3.eth.getAccounts(cb);
+        // TOOD: remove the try/catch if this is fixed: https://github.com/ethereum/web3.js/issues/442
+        try {
+            web3.personal.listAccounts(function (err, res) {
+                if (err) {
+                    web3.eth.getAccounts(cb);
+                } else {
+                    cb(err, res);
+                }
+            });
+        } catch (e) {
+            web3.eth.getAccounts(cb);
+        }
     } else {
         if (!this.accounts) return cb("No accounts?");
 
