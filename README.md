@@ -17,10 +17,19 @@ Note: it contains the latest release of Solidity available at the time of the pa
 
 Many dependencies are only provided via npm:
 
-	npm install    # fetch dependencies
-	npm run build  # build application into build/app.js
-
-Now point your browser to `index.html` to open the application.
+Once:
+```bash
+npm install    # fetch dependencies
+npm run build  # build application into build/app.js
+```
+Then:
+```bash
+npm run serve # => then open the logged http server url in your browser
+# usually: http://127.0.0.1:8080
+npm run watch
+npm run onchange # (optional regression standard lint testing)
+```
+Then open your `text editor` and start developing
 
 ### Troubleshooting building
 
