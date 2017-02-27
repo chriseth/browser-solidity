@@ -41,9 +41,11 @@
     "mkdirp": "^0.5.1",
     "nightwatch": "^0.9.3",
     "notify-error": "^1.2.0",
+    "npm-run-all": "^4.0.2",
+    "onchange": "^3.2.1",
     "solc": "https://github.com/ethereum/solc-js",
-    "swarmgw": "^0.2.0",
     "standard": "^8.6.0",
+    "swarmgw": "^0.2.0",
     "tape": "^4.5.1",
     "watchify": "^3.9.0",
     "web3": "^0.18.0",
@@ -73,5 +75,6 @@
       "soljson.js"
     ],
     "parser": "babel-eslint"
-  }
+  },
+  "dependencies": {}
 }
