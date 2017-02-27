@@ -5,3 +5,5 @@ reports
 soljson.js
 npm-debug.log*
 babelify-src
+.env.local
+sauceconnect.log
