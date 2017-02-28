@@ -26,6 +26,9 @@ var OffsetToLineColumnConverter = require('./lib/offsetToLineColumnConverter')
 
 var examples = require('./app/example-contracts')
 
+// components
+var fileExplorer = require('_file-explorer')
+
 // The event listener needs to be registered as early as possible, because the
 // parent will send the message upon the "load" event.
 var filesToLoad = null
@@ -156,10 +159,12 @@ var run = function () {
   chromeCloudSync()
 
   // ----------------- editor ----------------------
-
   var editor = new Editor()
-
-  // ----------------- tabbed menu -------------------
+  // -------------- fileExplorer ------------------
+  // @NOTE HTML#ID creates window['<ID name>'] element as a global
+  // var api = fileExplorer(window.treeview, files, editor)
+  fileExplorer(window.treeview, files, editor)
+  // ---------------- tabbed menu ------------------
   $('#options li').click(function (ev) {
     var $el = $(this)
     selectTab($el)

@@ -124,18 +124,6 @@ body {
     display: inline-block;
 }
 
-#input {
-    border-top: 3px solid #F4F6FF;
-    padding-top: 0.5em;
-    font-size: 15px;
-    position: absolute;
-    top: 2.5em;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    min-width: 20vw;
-}
-
 #righthand-panel {
     position: absolute;
     top: 0;
@@ -479,7 +467,7 @@ input[type="file"] {
     position:absolute;
     z-index:20;
     background-color:#F77E79;
-} 
+}
 
 .highlightcode_fullLine {
     position:absolute;
@@ -488,6 +476,6 @@ input[type="file"] {
     opacity: 0.5;
 }
 
-.ace_gutter-cell.ace_breakpoint{ 
+.ace_gutter-cell.ace_breakpoint{
     background-color: #F77E79;
 }

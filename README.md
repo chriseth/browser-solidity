@@ -22,14 +22,13 @@ Once:
 npm install    # fetch dependencies
 npm run build  # build application into build/app.js
 ```
-Then:
-```bash
-npm run serve # => then open the logged http server url in your browser
-# usually: http://127.0.0.1:8080
-npm run watch
-npm run onchange # (optional regression standard lint testing)
-```
-Then open your `text editor` and start developing
+
+
+## Developing
+* Just run `npm start` and open `127.0.0.1:8080` in your browser.
+* Then open your `text editor` and start developing
+* If you edit any files, your browser live reloads automagically :-)
+
 
 ### Troubleshooting building
 

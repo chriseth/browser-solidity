@@ -2,9 +2,31 @@
 
 var EventManager = require('../lib/eventManager')
 
+var csjs = require('csjs-inject')
 var ace = require('brace')
 var Range = ace.acequire('ace/range').Range
 require('../mode-solidity.js')
+
+var css = csjs`
+  .editor-container   {
+    display   : flex;
+    position  : absolute;
+    top       : 2.5em;
+    left      : 0;
+    right     : 0;
+    bottom    : 0;
+    min-width : 20vw;
+  }
+  .ace-editor   {
+    border-top  : 3px solid #F4F6FF;
+    padding-top : 0.5em;
+    font-size   : 15px;
+    height      : 98%;
+    width       : 100%;
+  }
+`
+document.querySelector('#editor-container').className = css['editor-container']
+document.querySelector('#input').className += css['ace-editor']
 
 function Editor () {
   var editor = ace.edit('input')

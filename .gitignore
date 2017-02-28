@@ -1,6 +1,7 @@
 .vscode
 build
 node_modules
+!src/node_modules
 reports
 soljson.js
 npm-debug.log*
