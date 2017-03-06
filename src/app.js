@@ -170,6 +170,28 @@ var run = function () {
     selectTab($el)
   })
 
+  /* -------------------------------------------------
+                  Toggle left hand panel
+  ------------------------------------------------- */
+  // @NOTE HTML#ID creates window['<ID name>'] element as a global
+  var toggleLHS = window.toggleLHP
+  var toggleIcon = document.querySelector('.toggleLHP i')
+  var newFile = document.querySelector('.newFile')
+  var filesWrapper = document.querySelector('.files-wrapper')
+  var uploadFile = document.querySelector('.uploadFile')
+  var treeview = window.treeview
+  var isHidden = false
+  function toggleTreeview () {
+    treeview.style.display = isHidden ? 'block' : 'none'
+    newFile.style.display = isHidden ? 'block' : 'none'
+    uploadFile.style.display = isHidden ? 'block' : 'none'
+    toggleLHS.classList = isHidden ? 'toggleLHP' : 'toggleLHP_isHidden'
+    filesWrapper.classList = isHidden ? 'files-wrapper' : 'files-wrapper_isHidden'
+    toggleIcon.classList = isHidden ? 'fa fa-angle-double-left' : 'fa fa-angle-double-right'
+    isHidden = !isHidden
+  }
+  toggleLHS.addEventListener('click', toggleTreeview)
+
   var selectTab = function (el) {
     var match = /[a-z]+View/.exec(el.get(0).className)
     if (!match) return
