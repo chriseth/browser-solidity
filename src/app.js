@@ -347,6 +347,8 @@ var run = function () {
 
     currentFile = file
 
+    files.event.trigger('fileFocus', [file])
+
     if (files.isReadOnly(file)) {
       editor.openReadOnly(file, files.get(file))
     } else {
