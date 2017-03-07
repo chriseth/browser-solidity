@@ -4,6 +4,7 @@
   "version": "0.0.0",
   "description": "Minimalistic browser-based Solidity IDE",
   "scripts": {
+    "prepublish": "npm-run-all -ls downloadsolc make-mock-compiler build",
     "build": "mkdirp build; browserify src/index.js -t yo-yoify -t [ babelify --presets [ es2015 ] ] | babili > build/app.js",
     "start": "npm-run-all -lpr serve watch onchange",
     "test": "standard; babel src --out-dir babelify-src; node test/index.js",
